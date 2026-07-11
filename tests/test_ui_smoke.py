@@ -7,16 +7,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QDir, QPoint, Qt
+from PySide6.QtCore import QDir, QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSplitter
 
 from cutvideo.app import create_application
 from cutvideo.audio import WaveformEnvelope
 from cutvideo.audio_processing import AudioProcessingProject, TranscriptToken
 from cutvideo.project import AudioInfo as ProjectAudioInfo
 from cutvideo.project import SourceFile
+from cutvideo.ui.file_drop_edit import FileDropLineEdit
 from cutvideo.ui.main_window import MainWindow
 from cutvideo.ui.waveform import WaveformWidget, _waveform_buckets
 
@@ -26,7 +27,7 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
     assert isinstance(app, QApplication)
     window = MainWindow()
     try:
-        assert window.windowTitle() == "离线音频剪辑器"
+        assert window.windowTitle() == "cutVideo by Hao"
         assert window.workspace_tabs.count() == 2
         assert window.workspace_tabs.tabText(0) == "Word 黄标剪辑"
         assert window.workspace_tabs.tabText(1) == "音频处理"
@@ -55,6 +56,55 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
         assert window.review_all_button.objectName() == "reviewAllButton"
         assert window.export_button.objectName() == "exportButton"
         assert not window.export_button.isEnabled()
+        assert not window.progress_container.isHidden()
+        assert window.progress_container.height() == 36
+        assert window.progress_bar.isHidden()
+        assert not window.audio_processing_widget.progress_container.isHidden()
+        assert window.audio_processing_widget.progress_container.height() == 36
+    finally:
+        window.close()
+
+
+def test_file_drop_edit_accepts_one_matching_local_file(tmp_path: Path) -> None:
+    create_application(["cutvideo-test"])
+    audio = tmp_path / "dragged.MP3"
+    audio.write_bytes(b"audio")
+    document = tmp_path / "notes.txt"
+    document.write_text("text", encoding="utf-8")
+    edit = FileDropLineEdit((".mp3", ".wav"))
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(audio))])
+
+    assert edit.accepts_path(audio)
+    assert edit._path_from_mime(mime) == audio.resolve()
+    assert not edit.accepts_path(document)
+
+
+def test_progress_controls_do_not_move_either_workspace_layout() -> None:
+    app = create_application(["cutvideo-test"])
+    window = MainWindow()
+    window.resize(1400, 900)
+    window.show()
+    try:
+        app.processEvents()
+        word_splitter = window.findChild(QSplitter, "reviewSplitter")
+        processing_splitter = window.findChild(QSplitter, "audioProcessingSplitter")
+        assert word_splitter is not None
+        assert processing_splitter is not None
+        word_before = word_splitter.geometry()
+        window.progress_bar.setVisible(True)
+        window.cancel_button.setVisible(True)
+        app.processEvents()
+        assert window.findChild(QSplitter, "reviewSplitter").geometry() == word_before
+
+        window.workspace_tabs.setCurrentIndex(1)
+        app.processEvents()
+        processing_before = processing_splitter.geometry()
+        workspace = window.audio_processing_widget
+        workspace.progress_bar.setVisible(True)
+        workspace.cancel_button.setVisible(True)
+        app.processEvents()
+        assert processing_splitter.geometry() == processing_before
     finally:
         window.close()
 

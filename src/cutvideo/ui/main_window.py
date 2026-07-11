@@ -39,6 +39,8 @@ from ..project import CandidateStatus, CutCandidate, ProjectV1, save_project
 from ..resources import discover_resources
 from .audio_player import AudioPlaybackError, PcmWavPlayer
 from .audio_processing_widget import AudioProcessingWidget
+from .file_drop_edit import FileDropLineEdit
+from .settings import dialog_start, remember_dialog_path
 from .waveform import WaveformWidget
 from .workers import (
     AnalysisResult,
@@ -85,7 +87,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("mainWindow")
-        self.setWindowTitle("离线音频剪辑器")
+        self.setWindowTitle("cutVideo by Hao")
         self.resize(1360, 900)
         self.setMinimumSize(980, 680)
 
@@ -118,7 +120,8 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._set_step(1)
         self._refresh_controls()
-        self.statusBar().showMessage("选择一段音频和对应的 Word 标注文档")
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().showMessage("就绪 · 可拖入音频与 Word，或切换到“音频处理”")
 
     def _build_ui(self) -> None:
         self.workspace_tabs = QTabWidget(self)
@@ -144,7 +147,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(18, 13, 18, 13)
         heading = QVBoxLayout()
         heading.setSpacing(2)
-        title = QLabel("离线 Word 黄标音频剪辑器")
+        title = QLabel("Word 黄标剪辑")
         title.setObjectName("titleLabel")
         subtitle = QLabel("黄色文字对应的语音将被删除；所有素材与模型只在本机处理")
         subtitle.setObjectName("subtitleLabel")
@@ -169,9 +172,9 @@ class MainWindow(QMainWindow):
         section_title.setObjectName("sectionTitle")
         input_layout.addWidget(section_title, 0, 0, 1, 4)
         input_layout.addWidget(QLabel("音频"), 1, 0)
-        self.audio_path_edit = QLineEdit()
+        self.audio_path_edit = FileDropLineEdit((".mp3", ".wav", ".m4a", ".aac", ".flac"))
         self.audio_path_edit.setObjectName("audioPathEdit")
-        self.audio_path_edit.setPlaceholderText("MP3、WAV、M4A/AAC 或 FLAC")
+        self.audio_path_edit.setPlaceholderText("拖入音频，或点击右侧选择文件")
         self.audio_browse_button = QPushButton("选择音频…")
         self.audio_browse_button.setObjectName("audioBrowseButton")
         input_layout.addWidget(self.audio_path_edit, 1, 1)
@@ -181,9 +184,9 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.open_project_button, 1, 3)
 
         input_layout.addWidget(QLabel("Word"), 2, 0)
-        self.docx_path_edit = QLineEdit()
+        self.docx_path_edit = FileDropLineEdit((".docx",))
         self.docx_path_edit.setObjectName("docxPathEdit")
-        self.docx_path_edit.setPlaceholderText("包含“发言人 HH:MM”和黄色标记的 DOCX")
+        self.docx_path_edit.setPlaceholderText("拖入带黄色标记的 Word，或点击右侧选择文件")
         self.docx_browse_button = QPushButton("选择 Word…")
         self.docx_browse_button.setObjectName("docxBrowseButton")
         input_layout.addWidget(self.docx_path_edit, 2, 1)
@@ -205,10 +208,12 @@ class MainWindow(QMainWindow):
         root.addWidget(input_card)
 
         self.progress_container = QWidget()
+        self.progress_container.setObjectName("reservedProgressArea")
+        self.progress_container.setFixedHeight(36)
         progress_layout = QHBoxLayout(self.progress_container)
         progress_layout.setContentsMargins(4, 0, 4, 0)
         progress_layout.setSpacing(10)
-        self.progress_label = QLabel("")
+        self.progress_label = QLabel(" ")
         self.progress_label.setObjectName("mutedLabel")
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("taskProgressBar")
@@ -220,12 +225,15 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_label)
         progress_layout.addWidget(self.progress_bar, 1)
         progress_layout.addWidget(self.cancel_button)
-        self.progress_container.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.cancel_button.setVisible(False)
         root.addWidget(self.progress_container)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("reviewSplitter")
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(18)
 
         list_card = QFrame()
         list_card.setObjectName("reviewCard")
@@ -407,7 +415,13 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.audio_browse_button.clicked.connect(self._choose_audio)
+        self.audio_path_edit.fileDropped.connect(
+            lambda path: self.statusBar().showMessage(f"已拖入音频：{Path(path).name}")
+        )
         self.docx_browse_button.clicked.connect(self._choose_document)
+        self.docx_path_edit.fileDropped.connect(
+            lambda path: self.statusBar().showMessage(f"已拖入 Word：{Path(path).name}")
+        )
         self.output_browse_button.clicked.connect(self._choose_output_directory)
         self.open_project_button.clicked.connect(self._choose_project)
         self.preflight_button.clicked.connect(self._start_preflight)
@@ -417,7 +431,7 @@ class MainWindow(QMainWindow):
         self.start_spin.valueChanged.connect(self._boundary_spin_changed)
         self.end_spin.valueChanged.connect(self._boundary_spin_changed)
         self.waveform.boundariesChanged.connect(self._waveform_boundaries_changed)
-        self.waveform.boundaryDragFinished.connect(lambda _start, _end: self._schedule_autosave())
+        self.waveform.boundaryDragFinished.connect(self._waveform_boundary_drag_finished)
         self.waveform.viewChanged.connect(self._waveform_view_changed)
         self.waveform_scrollbar.valueChanged.connect(self._waveform_scroll_changed)
         self.waveform_zoom_out_button.clicked.connect(self.waveform.zoom_out)
@@ -438,34 +452,49 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self._start_export)
         self.audio_path_edit.textChanged.connect(self._inputs_changed)
         self.docx_path_edit.textChanged.connect(self._inputs_changed)
+        self.audio_processing_widget.statusMessage.connect(self.statusBar().showMessage)
+        self.workspace_tabs.currentChanged.connect(self._workspace_changed)
+
+    def _workspace_changed(self, index: int) -> None:
+        if index == 1:
+            self.statusBar().showMessage("音频处理 · 拖入一段音频，完整识别后可选择文字或框选波形")
+        elif self.project is not None:
+            self.statusBar().showMessage("Word 黄标剪辑 · 项目已就绪")
+        else:
+            self.statusBar().showMessage("Word 黄标剪辑 · 可直接拖入音频与 Word")
 
     def _choose_audio(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "选择音频",
-            self.audio_path_edit.text() or "",
+            dialog_start("word_audio", self.audio_path_edit.text()),
             "音频文件 (*.mp3 *.wav *.m4a *.aac *.flac);;所有文件 (*)",
         )
         if path:
+            remember_dialog_path("word_audio", path)
             self.audio_path_edit.setText(path)
+            self.statusBar().showMessage(f"已选择音频：{Path(path).name}")
 
     def _choose_document(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "选择 Word 标注文档",
-            self.docx_path_edit.text() or "",
+            dialog_start("word_document", self.docx_path_edit.text()),
             "Word 文档 (*.docx)",
         )
         if path:
+            remember_dialog_path("word_document", path)
             self.docx_path_edit.setText(path)
+            self.statusBar().showMessage(f"已选择 Word：{Path(path).name}")
 
     def _choose_output_directory(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self,
             "选择导出目录",
-            self.output_path_edit.text() or self.audio_path_edit.text(),
+            dialog_start("word_output", self.output_path_edit.text() or self.audio_path_edit.text()),
         )
         if path:
+            remember_dialog_path("word_output", path)
             self.output_path_edit.setText(path)
             if self.project is not None:
                 self.project.export_options.output_directory = path
@@ -475,10 +504,11 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "打开 CutVideo 项目",
-            self.audio_path_edit.text() or "",
+            dialog_start("word_project", self.audio_path_edit.text()),
             "CutVideo 项目 (*.cutvideo.json);;JSON 文件 (*.json)",
         )
         if path:
+            remember_dialog_path("word_project", path)
             self.open_project(path)
 
     def open_project(self, path: str) -> None:
@@ -500,6 +530,16 @@ class MainWindow(QMainWindow):
         self.waveform.clear()
         self.input_summary_label.setText("输入已更改，请重新预检")
         self.review_summary_label.setText("等待分析")
+        audio_ready = bool(self.audio_path_edit.text().strip())
+        document_ready = bool(self.docx_path_edit.text().strip())
+        if audio_ready and document_ready:
+            self.statusBar().showMessage("音频与 Word 已就绪，可以开始预检")
+        elif audio_ready:
+            self.statusBar().showMessage("音频已就绪，请拖入或选择 Word 文档")
+        elif document_ready:
+            self.statusBar().showMessage("Word 已就绪，请拖入或选择音频")
+        else:
+            self.statusBar().showMessage("可直接拖入音频与 Word 文档")
         self._refresh_controls()
 
     def _start_preflight(self) -> None:
@@ -716,6 +756,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._selected_row = current_row
         self._show_selected_candidate(center=True)
+        candidate = self._current_candidate()
+        if candidate is not None and self.project is not None:
+            self.statusBar().showMessage(
+                f"候选 {current_row + 1}/{len(self.project.candidates)}：{candidate.text}"
+            )
         self._refresh_controls()
 
     def _current_candidate(self) -> CutCandidate | None:
@@ -799,6 +844,10 @@ class MainWindow(QMainWindow):
             self._updating_boundaries = False
         self._update_candidate_row(self._selected_row, candidate)
 
+    def _waveform_boundary_drag_finished(self, _start: int, _end: int) -> None:
+        self._schedule_autosave()
+        self.statusBar().showMessage("切点边界已调整并自动保存")
+
     def _waveform_view_changed(self, start: int, end: int) -> None:
         total = self.waveform.total_samples
         if total <= 0 or end <= start:
@@ -847,6 +896,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "切点无效", "结束切点必须晚于开始切点。")
             return
         candidate.approve(start, end)
+        self.statusBar().showMessage(f"已确认删除：{candidate.text}")
         self._candidate_status_changed(advance=True)
 
     def _skip_candidate(self) -> None:
@@ -854,6 +904,7 @@ class MainWindow(QMainWindow):
         if candidate is None:
             return
         candidate.skip()
+        self.statusBar().showMessage(f"已保留：{candidate.text}")
         self._candidate_status_changed(advance=True)
 
     def _reset_candidate(self) -> None:
@@ -861,6 +912,7 @@ class MainWindow(QMainWindow):
         if candidate is None:
             return
         candidate.reset()
+        self.statusBar().showMessage(f"已恢复建议切点：{candidate.text}")
         self._candidate_status_changed(advance=False)
         self._show_selected_candidate(center=True)
 
@@ -986,11 +1038,15 @@ class MainWindow(QMainWindow):
 
     def _playback_finished(self) -> None:
         if self._preview_queue_active:
+            self.statusBar().showMessage("当前切点试听完成，准备下一项…")
             QTimer.singleShot(120, self._advance_preview_queue)
+        else:
+            self.statusBar().showMessage("试听完成")
 
     def _playback_failed(self, message: str) -> None:
         self._preview_queue_active = False
         self._preview_queue.clear()
+        self.statusBar().showMessage("试听失败，请检查系统音频输出设备")
         QMessageBox.warning(self, "无法试听", message)
 
     def _stop_preview(self, *, clear_queue: bool = True) -> None:
@@ -998,6 +1054,8 @@ class MainWindow(QMainWindow):
             self._preview_queue_active = False
             self._preview_queue.clear()
         self._audio_player.stop()
+        if clear_queue:
+            self.statusBar().showMessage("试听已停止")
 
     def _start_export(self) -> None:
         if (
@@ -1063,8 +1121,11 @@ class MainWindow(QMainWindow):
         task.signals.cancelled.connect(self._task_cancelled)
         task.signals.finished.connect(lambda: self._foreground_finished(task))
         self.progress_label.setText(initial_message)
+        self.progress_label.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_container.setVisible(True)
+        self.progress_bar.setVisible(True)
+        self.cancel_button.setVisible(True)
+        self.statusBar().showMessage(initial_message)
         self._refresh_controls()
         self.thread_pool.start(task)
 
@@ -1088,6 +1149,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
         if message:
             self.progress_label.setText(message)
+            self.statusBar().showMessage(message)
 
     def _task_error(self, message: str) -> None:
         self._preview_queue_active = False
@@ -1103,7 +1165,10 @@ class MainWindow(QMainWindow):
     def _foreground_finished(self, task: BackgroundTask) -> None:
         if self._active_task is task:
             self._active_task = None
-        self.progress_container.setVisible(False)
+        self.progress_label.setText(" ")
+        self.progress_label.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
         self._refresh_controls()
 
     def _auxiliary_finished(self, task: BackgroundTask, on_finished=None) -> None:  # type: ignore[no-untyped-def]
@@ -1195,6 +1260,7 @@ class MainWindow(QMainWindow):
 
 def _make_time_spin(name: str) -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
+    spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
     spin.setObjectName(name)
     spin.setDecimals(3)
     spin.setRange(0.0, 86_400_000.0)

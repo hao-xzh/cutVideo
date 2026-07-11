@@ -5,7 +5,16 @@ from __future__ import annotations
 from contextlib import suppress
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QPoint, QSignalBlocker, Qt, QTemporaryDir, QThreadPool, QTimer
+from PySide6.QtCore import (
+    QDir,
+    QPoint,
+    QSignalBlocker,
+    Qt,
+    QTemporaryDir,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -54,6 +63,8 @@ from .audio_processing_workers import (
     make_audio_processing_load_operation,
     make_audio_processing_preview_operation,
 )
+from .file_drop_edit import FileDropLineEdit
+from .settings import dialog_start, remember_dialog_path
 from .waveform import WaveformWidget
 from .workers import BackgroundTask, CandidatePreviewResult, make_waveform_operation
 
@@ -62,6 +73,8 @@ _SCROLL_STEPS = 100_000
 
 class AudioProcessingWidget(QWidget):
     """Full audio transcription, region annotations, preview and export."""
+
+    statusMessage = Signal(str)
 
     def __init__(self, thread_pool: QThreadPool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -81,6 +94,7 @@ class AudioProcessingWidget(QWidget):
         self._preview_directory = QTemporaryDir(template)
         self._player = PcmWavPlayer(self)
         self._player.failed.connect(self._playback_failed)
+        self._player.finished.connect(lambda: self.statusMessage.emit("试听完成"))
         self._player.active_changed.connect(lambda _active: self._refresh_controls())
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
@@ -119,9 +133,9 @@ class AudioProcessingWidget(QWidget):
         input_layout.setContentsMargins(18, 13, 18, 13)
         input_layout.setHorizontalSpacing(10)
         input_layout.addWidget(QLabel("音频"), 0, 0)
-        self.audio_path_edit = QLineEdit()
+        self.audio_path_edit = FileDropLineEdit((".mp3", ".wav", ".m4a", ".aac", ".flac"))
         self.audio_path_edit.setObjectName("processingAudioPathEdit")
-        self.audio_path_edit.setPlaceholderText("选择一个需要单独处理的 MP3、WAV、M4A/AAC 或 FLAC")
+        self.audio_path_edit.setPlaceholderText("拖入单独音频，或点击右侧选择文件")
         self.audio_browse_button = QPushButton("选择音频…")
         self.audio_browse_button.setObjectName("processingAudioBrowseButton")
         self.open_project_button = QPushButton("打开项目…")
@@ -140,9 +154,11 @@ class AudioProcessingWidget(QWidget):
         root.addWidget(input_card)
 
         self.progress_container = QWidget()
+        self.progress_container.setObjectName("reservedProgressArea")
+        self.progress_container.setFixedHeight(36)
         progress_layout = QHBoxLayout(self.progress_container)
         progress_layout.setContentsMargins(4, 0, 4, 0)
-        self.progress_label = QLabel("")
+        self.progress_label = QLabel(" ")
         self.progress_label.setObjectName("mutedLabel")
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
@@ -151,12 +167,15 @@ class AudioProcessingWidget(QWidget):
         progress_layout.addWidget(self.progress_label)
         progress_layout.addWidget(self.progress_bar, 1)
         progress_layout.addWidget(self.cancel_button)
-        self.progress_container.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.cancel_button.setVisible(False)
         root.addWidget(self.progress_container)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("audioProcessingSplitter")
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(18)
 
         transcript_card = QFrame()
         transcript_card.setObjectName("reviewCard")
@@ -294,6 +313,9 @@ class AudioProcessingWidget(QWidget):
     def _connect_signals(self) -> None:
         self.audio_browse_button.clicked.connect(self._choose_audio)
         self.audio_path_edit.textChanged.connect(lambda _value: self._refresh_controls())
+        self.audio_path_edit.fileDropped.connect(
+            lambda path: self.statusMessage.emit(f"已拖入音频：{Path(path).name}，可以开始完整识别")
+        )
         self.open_project_button.clicked.connect(self._choose_project)
         self.transcribe_button.clicked.connect(self._start_transcription)
         self.cancel_button.clicked.connect(self._cancel_task)
@@ -314,7 +336,7 @@ class AudioProcessingWidget(QWidget):
         self.end_spin.valueChanged.connect(self._spin_selection_changed)
         self.preview_selection_button.clicked.connect(lambda: self._start_preview("selection"))
         self.preview_edited_button.clicked.connect(lambda: self._start_preview("edited"))
-        self.stop_button.clicked.connect(self._player.stop)
+        self.stop_button.clicked.connect(self._stop_playback)
         self.output_browse_button.clicked.connect(self._choose_output)
         self.output_edit.textChanged.connect(self._output_changed)
         self.export_button.clicked.connect(self._start_export)
@@ -328,25 +350,33 @@ class AudioProcessingWidget(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "选择需要处理的音频",
-            self.audio_path_edit.text(),
+            dialog_start("processing_audio", self.audio_path_edit.text()),
             "音频文件 (*.mp3 *.wav *.m4a *.aac *.flac);;所有文件 (*)",
         )
         if path:
+            remember_dialog_path("processing_audio", path)
             self.audio_path_edit.setText(path)
+            self.statusMessage.emit(f"已选择音频：{Path(path).name}，可以开始完整识别")
 
     def _choose_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "打开音频处理项目",
-            self.audio_path_edit.text(),
+            dialog_start("processing_project", self.audio_path_edit.text()),
             "音频处理项目 (*.audioprocess.json);;JSON 文件 (*.json)",
         )
         if path:
+            remember_dialog_path("processing_project", path)
             self._start_task(make_audio_processing_load_operation(path), self._analysis_ready)
 
     def _choose_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择导出目录", self.output_edit.text())
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "选择导出目录",
+            dialog_start("processing_output", self.output_edit.text()),
+        )
         if path:
+            remember_dialog_path("processing_output", path)
             self.output_edit.setText(path)
 
     def _start_transcription(self) -> None:
@@ -355,6 +385,7 @@ class AudioProcessingWidget(QWidget):
             QMessageBox.information(self, "请选择音频", "请先选择一个需要单独处理的音频文件。")
             return
         self._start_task(make_audio_processing_analysis_operation(path), self._analysis_ready)
+        self.statusMessage.emit("正在完整识别音频，所有处理均在本机完成…")
 
     def _analysis_ready(self, value: object) -> None:
         assert isinstance(value, AudioProcessingAnalysisResult)
@@ -370,6 +401,9 @@ class AudioProcessingWidget(QWidget):
         self.summary_label.setText(
             f"{len(value.project.tokens)} 个带时间戳文字 · 音频 {duration} · "
             f"{len(value.project.annotations)} 个删除标注"
+        )
+        self.statusMessage.emit(
+            f"完整识别完成：{len(value.project.tokens)} 个时间戳文字，可选择文字建立标注"
         )
         self.waveform.clear()
         self.waveform.set_placeholder("正在后台生成完整波形…")
@@ -460,6 +494,9 @@ class AudioProcessingWidget(QWidget):
             f"已选择 {right - left} 字 · {_format_sample(start, self.project.audio_info.sample_rate)}"
             f" – {_format_sample(end, self.project.audio_info.sample_rate)}"
         )
+        self.statusMessage.emit(
+            f"已选择 {right - left} 个文字，可标注删除或试听当前范围"
+        )
         if self.waveform_envelope is not None:
             self.waveform.set_selection(start, end)
         self._set_spin_samples(start, end)
@@ -493,6 +530,7 @@ class AudioProcessingWidget(QWidget):
         self._populate_annotations(select_id=annotation.id)
         self._refresh_transcript_formats()
         self._schedule_autosave()
+        self.statusMessage.emit(f"已建立删除标注：{annotation.text}")
 
     def _remove_selected_annotation(self) -> None:
         if self.project is None or self._editing_annotation_id is None:
@@ -502,6 +540,7 @@ class AudioProcessingWidget(QWidget):
             self._populate_annotations()
             self._refresh_transcript_formats()
             self._schedule_autosave()
+            self.statusMessage.emit("已取消所选删除标注")
 
     def _populate_annotations(self, *, select_id: str | None = None) -> None:
         self.annotation_table.setRowCount(0)
@@ -571,6 +610,9 @@ class AudioProcessingWidget(QWidget):
     def _waveform_drag_finished(self, _start: int, _end: int) -> None:
         if self._editing_annotation() is not None:
             self._schedule_autosave()
+            self.statusMessage.emit("删除标注边界已调整并自动保存")
+        else:
+            self.statusMessage.emit("试听框选范围已更新")
 
     def _set_spin_samples(self, start: int, end: int) -> None:
         if self.project is None:
@@ -659,6 +701,7 @@ class AudioProcessingWidget(QWidget):
             QMessageBox.information(self, "没有试听范围", "请先选择文字或在波形上框选范围。")
             return
         self._player.stop()
+        self.statusMessage.emit("正在生成本地试听，不会上传音频…")
         self._start_task(
             make_audio_processing_preview_operation(
                 self.project,
@@ -677,8 +720,11 @@ class AudioProcessingWidget(QWidget):
             self._player.play(path)
         except AudioPlaybackError as exc:
             self._playback_failed(str(exc))
+        else:
+            self.statusMessage.emit("正在试听删除后效果" if mode == "edited" else "正在试听框选范围")
 
     def _playback_failed(self, message: str) -> None:
+        self.statusMessage.emit("试听失败，请检查系统音频输出设备")
         QMessageBox.warning(self, "无法试听", message or "音频设备播放失败，请检查系统输出设备。")
 
     def _start_export(self) -> None:
@@ -702,6 +748,7 @@ class AudioProcessingWidget(QWidget):
             f"已生成：\n{value.wav_path.name}\n{value.mp3_path.name}\n\n"
             f"共删除 {value.removed_samples} 个 PCM 样本。",
         )
+        self.statusMessage.emit(f"音频处理导出完成：{value.wav_path.parent}")
 
     def _output_changed(self, value: str) -> None:
         if self.project is not None:
@@ -723,14 +770,14 @@ class AudioProcessingWidget(QWidget):
             return
         task = BackgroundTask(operation)
         self._active_task = task
-        self.progress_container.setVisible(True)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.cancel_button.setVisible(True)
         self.progress_bar.setValue(0)
         task.signals.progress.connect(self._task_progress)
         task.signals.result.connect(callback)
-        task.signals.error.connect(lambda message: QMessageBox.warning(self, "操作失败", message))
-        task.signals.cancelled.connect(
-            lambda: self.summary_label.setText("操作已取消，可重新开始")
-        )
+        task.signals.error.connect(self._task_error)
+        task.signals.cancelled.connect(self._task_cancelled)
         task.signals.finished.connect(self._task_finished)
         self.thread_pool.start(task)
         self._refresh_controls()
@@ -738,10 +785,27 @@ class AudioProcessingWidget(QWidget):
     def _task_progress(self, value: int, message: str) -> None:
         self.progress_bar.setValue(value)
         self.progress_label.setText(message)
+        if message:
+            self.statusMessage.emit(message)
+
+    def _task_error(self, message: str) -> None:
+        self.statusMessage.emit(f"操作失败：{message}")
+        QMessageBox.warning(self, "操作失败", message)
+
+    def _task_cancelled(self) -> None:
+        self.summary_label.setText("操作已取消，可重新开始")
+        self.statusMessage.emit("操作已取消")
+
+    def _stop_playback(self) -> None:
+        self._player.stop()
+        self.statusMessage.emit("试听已停止")
 
     def _task_finished(self) -> None:
         self._active_task = None
-        self.progress_container.setVisible(False)
+        self.progress_label.setText(" ")
+        self.progress_label.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
         self._refresh_controls()
 
     def _cancel_task(self) -> None:
@@ -792,6 +856,7 @@ class AudioProcessingWidget(QWidget):
 
 def _time_spin(name: str) -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
+    spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
     spin.setObjectName(name)
     spin.setDecimals(3)
     spin.setRange(0.0, 99_999_999.0)
