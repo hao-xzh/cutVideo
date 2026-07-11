@@ -1,0 +1,36 @@
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+.build/
+dist/
+dist-debug/
+release/
+*.spec
+# User source material must never be committed accidentally.
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.docx
+*.cutvideo.json
+*_剪辑完成.mp3
+*_剪辑完成.wav
+*_切点.csv
+.cutvideo-cache/
+*.egg-info/
+cutvideo-preview-*/
+cutvideo-selftest*.json
+nuitka-crash-report.xml
+
+# Release weights and platform binaries are fetched/built locally. GitHub's
+# normal Git object limit is far below the 0.9 GB Paraformer checkpoint.
+resources/models/*
+!resources/models/.gitkeep
+!resources/models/README.md
+resources/bin/*/*
+!resources/bin/*/.gitkeep

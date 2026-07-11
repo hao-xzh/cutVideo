@@ -1,0 +1,38 @@
+Source archive:
+https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip
+Archive SHA-256:
+50045f92a5ac72f406873bcceed48518df2a53ed295390febb9953e7ca32e157
+
+Corresponding FFmpeg source revision:
+https://github.com/FFmpeg/FFmpeg/commit/300cac3078
+
+License copied from the binary archive:
+licenses/LGPL-3.0-FFmpeg-BtbN.txt
+
+FFmpeg version:
+N-125519-g300cac3078-20260711
+
+Downloaded and verified on 2026-07-11. The BtbN `lgpl` variant intentionally excludes GPL-only
+and nonfree dependencies. The release manifest records SHA-256 values for ffmpeg.exe and
+ffprobe.exe.
+
+Build configuration reported by ffmpeg:
+--prefix=/ffbuild/prefix --pkg-config-flags=--static --pkg-config=pkg-config
+--cross-prefix=x86_64-w64-mingw32- --arch=x86_64 --target-os=mingw32 --enable-version3
+--disable-debug --disable-w32threads --enable-pthreads --enable-iconv --enable-zlib
+--enable-libxml2 --enable-libvmaf --enable-fontconfig --enable-libharfbuzz --enable-libfreetype
+--enable-libfribidi --enable-vulkan --enable-libshaderc --enable-libvorbis --disable-libxcb
+--disable-xlib --disable-libpulse --enable-gmp --enable-lzma --enable-liblcevc-dec
+--enable-opencl --enable-amf --enable-libaom --enable-libaribb24 --disable-avisynth
+--enable-chromaprint --enable-libdav1d --disable-libdavs2 --disable-libdvdread
+--disable-libdvdnav --disable-libfdk-aac --enable-ffnvcodec --enable-cuda-llvm
+--disable-frei0r --enable-libgme --enable-libkvazaar --enable-libaribcaption --enable-libass
+--enable-libbluray --enable-libjxl --enable-libmp3lame --enable-libopus --enable-libplacebo
+--enable-librist --enable-libssh --enable-libtheora --enable-libvpx --enable-libwebp
+--enable-libzmq --enable-lv2 --enable-libvpl --enable-openal --enable-liboapv
+--enable-libopencore-amrnb --enable-libopencore-amrwb --enable-libopenh264
+--enable-libopenjpeg --enable-libopenmpt --enable-librav1e --disable-librubberband
+--enable-schannel --enable-sdl2 --enable-libsnappy --enable-libsoxr --enable-libsrt
+--enable-libsvtav1 --enable-libtwolame --enable-libuavs3d --disable-libdrm --enable-vaapi
+--disable-libvidstab --enable-libvvenc --disable-whisper --disable-libx264 --disable-libx265
+--disable-libxavs2 --disable-libxvid --enable-libzimg --enable-libzvbi

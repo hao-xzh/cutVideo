@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import numpy as np
+import pytest
+from PySide6.QtCore import QDir, QPoint, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+
+from cutvideo.app import create_application
+from cutvideo.audio import WaveformEnvelope
+from cutvideo.ui.main_window import MainWindow
+from cutvideo.ui.waveform import WaveformWidget, _waveform_buckets
+
+
+def test_main_window_constructs_with_core_workflow_controls() -> None:
+    app = create_application(["cutvideo-test"])
+    assert isinstance(app, QApplication)
+    window = MainWindow()
+    try:
+        assert window.windowTitle() == "离线 Word 黄标音频剪辑器"
+        assert not app.windowIcon().isNull()
+        assert window.centralWidget().objectName() == "mainScrollArea"
+        assert window.step_labels[0].property("stepState") == "active"
+        assert Path(window._preview_directory.path()).parent == Path(QDir.tempPath())
+        assert window.audio_path_edit.objectName() == "audioPathEdit"
+        assert window.docx_path_edit.objectName() == "docxPathEdit"
+        assert window.preflight_button.objectName() == "preflightButton"
+        assert window.analyze_button.objectName() == "analyzeButton"
+        assert window.candidate_table.columnCount() == 6
+        assert window.preview_original_button.text() == "听原句"
+        assert window.preview_selection_button.text() == "只听待删"
+        assert window.preview_edited_button.text() == "听剪后"
+        assert window.approve_button.text() == "确认删除"
+        assert window.skip_button.text() == "保留此处"
+        assert window.start_minus_button.text() == "−20 ms"
+        assert window.end_plus_button.text() == "+20 ms"
+        assert window.waveform_zoom_out_button.text() == "缩小"
+        assert window.waveform_zoom_in_button.text() == "放大"
+        assert window.waveform_focus_button.text() == "定位切点"
+        assert window.waveform_scrollbar.objectName() == "waveformScrollBar"
+        assert window.review_all_button.objectName() == "reviewAllButton"
+        assert window.export_button.objectName() == "exportButton"
+        assert not window.export_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_waveform_widget_keeps_valid_selection() -> None:
+    create_application(["cutvideo-test"])
+    widget = WaveformWidget()
+    widget.set_selection(20, 10)
+    start, end = widget.selection
+    assert 0 <= start < end
+
+
+def _interactive_envelope() -> WaveformEnvelope:
+    minimum = np.full(1_000, -0.2, dtype=np.float32)
+    maximum = np.full(1_000, 0.2, dtype=np.float32)
+    return WaveformEnvelope(
+        sample_rate=1_000,
+        block_size=10,
+        minimum=minimum,
+        maximum=maximum,
+        rms=np.full(1_000, 0.1, dtype=np.float32),
+    )
+
+
+def test_waveform_view_can_pan_zoom_and_return_to_selection() -> None:
+    create_application(["cutvideo-test"])
+    widget = WaveformWidget()
+    widget.set_envelope(_interactive_envelope(), 10_000)
+    widget.set_selection(4_000, 4_500)
+
+    assert widget.view_range == (2_000, 6_500)
+    assert widget.selection == (4_000, 4_500)
+
+    widget.pan_by_fraction(0.5)
+    assert widget.view_range == (4_250, 8_750)
+    assert widget.selection == (4_000, 4_500)
+
+    widget.set_scroll_position(1.0)
+    assert widget.view_range == (5_500, 10_000)
+
+    old_span = widget.view_range[1] - widget.view_range[0]
+    widget.zoom_in()
+    assert widget.view_range[1] - widget.view_range[0] < old_span
+
+    widget.focus_selection()
+    assert widget.view_range == (2_000, 6_500)
+
+
+def test_dragging_boundary_near_edge_auto_pans_the_waveform() -> None:
+    create_application(["cutvideo-test"])
+    widget = WaveformWidget()
+    widget.resize(600, 200)
+    widget.set_envelope(_interactive_envelope(), 10_000)
+    widget.set_selection(4_000, 4_500)
+    widget.show()
+    try:
+        end_x = round(widget._sample_to_x(4_500))
+        QTest.mousePress(
+            widget,
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(end_x, 100),
+        )
+        QTest.mouseMove(widget, QPoint(590, 100))
+        QTest.mouseRelease(
+            widget,
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(590, 100),
+        )
+
+        assert widget.selection[1] > 6_300
+        assert widget.view_range[1] > 6_500
+    finally:
+        widget.close()
+
+
+def test_main_window_scrollbar_tracks_normalized_waveform_view() -> None:
+    create_application(["cutvideo-test"])
+    window = MainWindow()
+    try:
+        window.waveform.set_envelope(_interactive_envelope(), 10_000)
+        window.waveform.set_selection(4_000, 4_500)
+
+        assert window.waveform_scrollbar.maximum() > 0
+        assert window.waveform_scrollbar.singleStep() < window.waveform_scrollbar.pageStep()
+        window.waveform_scrollbar.setValue(window.waveform_scrollbar.maximum())
+        assert window.waveform.view_range == (5_500, 10_000)
+
+        window.waveform_zoom_in_button.setEnabled(True)
+        old_span = window.waveform.view_range[1] - window.waveform.view_range[0]
+        window.waveform_zoom_in_button.click()
+        assert window.waveform.view_range[1] - window.waveform.view_range[0] < old_span
+    finally:
+        window.close()
+
+
+def test_full_duration_waveform_is_pixel_bounded_without_losing_peaks() -> None:
+    minimum = np.zeros(500_000, dtype=np.float32)
+    maximum = np.zeros(500_000, dtype=np.float32)
+    minimum[123_456] = -0.9
+    maximum[345_678] = 0.8
+    envelope = WaveformEnvelope(48_000, 240, minimum, maximum, np.zeros_like(minimum))
+
+    indexes, visible_minimum, visible_maximum = _waveform_buckets(
+        envelope, 0, envelope.points, max_points=2_000
+    )
+
+    assert len(indexes) <= 2_000
+    assert visible_minimum.min() == pytest.approx(-0.9)
+    assert visible_maximum.max() == pytest.approx(0.8)

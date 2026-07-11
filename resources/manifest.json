@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "binaries": {
+    "windows-x86_64": {
+      "ffmpeg": "ef7c4a8f87df5b44cab54bc7367b3bb32da6c8fa096f43e14490d43e8f114934",
+      "ffprobe": "d17c30cdfe7239413ee6f1446b48e32a5488940081ac3e541258f402316b22d0",
+      "source": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip",
+      "source_code": "https://github.com/FFmpeg/FFmpeg/commit/300cac3078",
+      "archive_sha256": "50045f92a5ac72f406873bcceed48518df2a53ed295390febb9953e7ca32e157",
+      "license": "licenses/LGPL-3.0-FFmpeg-BtbN.txt",
+      "version": "N-125519-g300cac3078-20260711",
+      "variant": "win64-lgpl-static"
+    },
+    "macos-arm64": {
+      "ffmpeg": null,
+      "ffprobe": null
+    }
+  },
+  "models": {
+    "fa-zh": {
+      "path": "models/fa-zh",
+      "sha256": "7f8bc065b92d957b2d1bdef69aeeaff4cd30a367807247f408b945401a96c87b",
+      "license": "licenses/Apache-2.0.txt",
+      "source": "iic/speech_timestamp_prediction-v1-16k-offline",
+      "revision": "ed6abeae67748098b6055978a17eefd2fa0f9fd6"
+    },
+    "paraformer-zh": {
+      "path": "models/paraformer-zh",
+      "sha256": "9def35448a2533a66c7b9acdaf159b467a7d26b1cd633859c8ec074dd175502d",
+      "license": "licenses/Apache-2.0.txt",
+      "source": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+      "revision": "6059253cbfda9ea43d6c6f198d38854f09adb298"
+    },
+    "fsmn-vad": {
+      "path": "models/fsmn-vad",
+      "sha256": "3a08ba26f5f4337c4120cc0665cb59599f7b7d445e9a6e24728de2ab9b30a235",
+      "license": "licenses/Apache-2.0.txt",
+      "source": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "revision": "f9a8b8274674755d925277e27063869038d41515"
+    }
+  }
+}
