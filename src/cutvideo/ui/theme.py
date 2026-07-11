@@ -8,8 +8,27 @@ QWidget {
     font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
     font-size: 13px;
 }
-QMainWindow, QWidget#centralWidget {
+QMainWindow, QWidget#centralWidget, QWidget#audioProcessingWorkspace {
     background: #f4f6f8;
+}
+QTabWidget#workspaceTabs::pane {
+    border: none;
+    background: #f4f6f8;
+}
+QTabWidget#workspaceTabs QTabBar::tab {
+    min-width: 150px;
+    min-height: 35px;
+    padding: 0 18px;
+    color: #657287;
+    background: #edf1f5;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-weight: 600;
+}
+QTabWidget#workspaceTabs QTabBar::tab:selected {
+    color: #245ec7;
+    background: #ffffff;
+    border-bottom-color: #2f68d2;
 }
 QFrame#headerCard, QFrame#inputCard, QFrame#reviewCard, QFrame#exportCard {
     background: #ffffff;
@@ -23,6 +42,14 @@ QLabel#titleLabel {
 }
 QLabel#subtitleLabel, QLabel#mutedLabel, QLabel#hintLabel {
     color: #697586;
+}
+QLabel#shortcutBadge {
+    color: #55647a;
+    background: #f0f3f7;
+    border: 1px solid #dbe1e8;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: "Cascadia Mono", "SFMono-Regular", monospace;
 }
 QLabel#sectionTitle {
     color: #1c283b;
@@ -58,6 +85,19 @@ QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {
 QLineEdit:disabled, QDoubleSpinBox:disabled {
     color: #8c96a5;
     background: #f3f5f7;
+}
+QTextEdit#processingTranscriptEdit {
+    color: #263348;
+    background: #ffffff;
+    border: 1px solid #d9e0e8;
+    border-radius: 7px;
+    padding: 14px;
+    selection-background-color: #bfd2fb;
+    selection-color: #1b2a40;
+    font-size: 15px;
+}
+QTextEdit#processingTranscriptEdit:focus {
+    border-color: #7d9edb;
 }
 QPushButton {
     min-height: 32px;

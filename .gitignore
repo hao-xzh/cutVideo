@@ -18,9 +18,12 @@ release/
 *.flac
 *.docx
 *.cutvideo.json
+*.audioprocess.json
 *_剪辑完成.mp3
 *_剪辑完成.wav
 *_切点.csv
+*_处理完成.mp3
+*_处理完成.wav
 .cutvideo-cache/
 *.egg-info/
 cutvideo-preview-*/

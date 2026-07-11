@@ -22,8 +22,10 @@ def _verify_preview_backend(report: dict[str, Any]) -> None:
     # Windows.  The editor plays FFmpeg-generated PCM through QAudioSink and
     # intentionally does not depend on QMediaPlayer codec plugins.
     from .ui.audio_player import PcmWavPlayer
+    from .ui.audio_processing_widget import AudioProcessingWidget
 
     report["preview_backend"] = PcmWavPlayer.__name__
+    report["audio_processing_workspace"] = AudioProcessingWidget.__name__
 
 
 def _run_self_test(*, include_models: bool) -> dict[str, Any]:
@@ -78,11 +80,12 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
 
     asr_audio = resources.asr_model / "example" / "asr_example.wav"
     asr_info = probe_audio(asr_audio, tools=tools)
-    asr_track = FunASRAsrAligner(
+    recognizer = FunASRAsrAligner(
         resources.asr_model,
         resources.vad_model,
         ffmpeg_path=tools.ffmpeg,
-    ).align(
+    )
+    asr_track = recognizer.align(
         audio_path=asr_audio,
         transcript=transcript,
         window_start_ms=0,
@@ -90,6 +93,13 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
     )
     if not asr_track.spans:
         raise RuntimeError("paraformer-zh/fsmn-vad inference returned no timestamp spans")
+    raw_tokens = recognizer.recognize(
+        audio_path=asr_audio,
+        window_start_ms=0,
+        window_end_ms=max(1, round(asr_info.duration_seconds * 1000)),
+    )
+    if not raw_tokens:
+        raise RuntimeError("standalone audio transcription returned no timestamp tokens")
     report.update(
         {
             "models_tested": True,
@@ -97,6 +107,7 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
             "fa_coverage": force_track.coverage,
             "asr_span_count": len(asr_track.spans),
             "asr_coverage": asr_track.coverage,
+            "raw_transcript_token_count": len(raw_tokens),
         }
     )
     _verify_preview_backend(report)

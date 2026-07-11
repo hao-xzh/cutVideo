@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +38,7 @@ from ..ffmpeg import FFmpegTools, discover_ffmpeg
 from ..project import CandidateStatus, CutCandidate, ProjectV1, save_project
 from ..resources import discover_resources
 from .audio_player import AudioPlaybackError, PcmWavPlayer
+from .audio_processing_widget import AudioProcessingWidget
 from .waveform import WaveformWidget
 from .workers import (
     AnalysisResult,
@@ -83,7 +85,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("mainWindow")
-        self.setWindowTitle("离线 Word 黄标音频剪辑器")
+        self.setWindowTitle("离线音频剪辑器")
         self.resize(1360, 900)
         self.setMinimumSize(980, 680)
 
@@ -119,11 +121,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("选择一段音频和对应的 Word 标注文档")
 
     def _build_ui(self) -> None:
-        viewport = QScrollArea(self)
+        self.workspace_tabs = QTabWidget(self)
+        self.workspace_tabs.setObjectName("workspaceTabs")
+        self.workspace_tabs.setDocumentMode(True)
+        self.setCentralWidget(self.workspace_tabs)
+        viewport = QScrollArea()
         viewport.setObjectName("mainScrollArea")
         viewport.setWidgetResizable(True)
         viewport.setFrameShape(QFrame.Shape.NoFrame)
-        self.setCentralWidget(viewport)
+        self.workspace_tabs.addTab(viewport, "Word 黄标剪辑")
         central = QWidget()
         central.setObjectName("centralWidget")
         central.setMinimumSize(1080, 820)
@@ -389,6 +395,15 @@ class MainWindow(QMainWindow):
         self.audio_edit = self.audio_path_edit
         self.document_edit = self.docx_path_edit
         self.analysis_button = self.analyze_button
+
+        processing_viewport = QScrollArea()
+        processing_viewport.setObjectName("audioProcessingScrollArea")
+        processing_viewport.setWidgetResizable(True)
+        processing_viewport.setFrameShape(QFrame.Shape.NoFrame)
+        self.audio_processing_widget = AudioProcessingWidget(self.thread_pool)
+        self.audio_processing_widget.setMinimumSize(1080, 820)
+        processing_viewport.setWidget(self.audio_processing_widget)
+        self.workspace_tabs.addTab(processing_viewport, "音频处理")
 
     def _connect_signals(self) -> None:
         self.audio_browse_button.clicked.connect(self._choose_audio)
@@ -1165,6 +1180,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self._autosave_timer.stop()
         self._stop_preview()
+        self.audio_processing_widget.shutdown()
         if self._active_task is not None:
             self._active_task.cancel()
         for task in tuple(self._auxiliary_tasks):

@@ -246,6 +246,24 @@ class AlignmentTrack:
             raise ValueError("coverage must be between zero and one")
 
 
+@dataclass(frozen=True, slots=True)
+class RecognizedToken:
+    """One ASR character with an absolute millisecond interval."""
+
+    text: str
+    start_ms: float
+    end_ms: float
+    confidence: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not self.text:
+            raise ValueError("recognized token text must not be empty")
+        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+            raise ValueError("invalid recognized token interval")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("recognized token confidence must be between zero and one")
+
+
 @runtime_checkable
 class ForceAligner(Protocol):
     """Replaceable forced-aligner interface used by :func:`align_transcript`."""
@@ -521,6 +539,29 @@ def alignment_track_from_model_result(
     return AlignmentTrack(tuple(spans), engine, len(covered) / len(reference.text))
 
 
+def recognition_tokens_from_model_result(
+    result: object,
+    *,
+    time_offset_ms: float = 0.0,
+    timestamps_in_seconds: bool = False,
+) -> tuple[RecognizedToken, ...]:
+    """Convert a raw FunASR result into timestamped display characters."""
+
+    observed = _observed_characters(
+        result,
+        normalize_with_mapping(""),
+        time_offset_ms=time_offset_ms,
+        timestamps_in_seconds=timestamps_in_seconds,
+    )
+    tokens = [
+        RecognizedToken(character, start_ms, end_ms)
+        for character, start_ms, end_ms in observed
+        if character and end_ms > start_ms >= 0
+    ]
+    tokens.sort(key=lambda token: (token.start_ms, token.end_ms))
+    return tuple(tokens)
+
+
 class FunASRForceAligner:
     """Local ``fa-zh`` adapter.  The model is loaded lazily and never downloaded."""
 
@@ -655,6 +696,38 @@ class FunASRAsrAligner:
             result,
             transcript,
             engine="paraformer-zh+fsmn-vad",
+            time_offset_ms=window_start_ms,
+            timestamps_in_seconds=self.timestamps_in_seconds,
+        )
+
+    def recognize(
+        self,
+        *,
+        audio_path: str | Path,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> tuple[RecognizedToken, ...]:
+        """Recognize one audio window without requiring a reference transcript."""
+
+        with local_audio_window(
+            audio_path,
+            start_ms=window_start_ms,
+            end_ms=window_end_ms,
+            ffmpeg_path=self.ffmpeg_path,
+        ) as window:
+            try:
+                result = self._get_model().generate(
+                    input=str(window),
+                    batch_size_s=300,
+                    use_itn=False,
+                    pred_timestamp=True,
+                    disable_pbar=True,
+                    disable_log=True,
+                )
+            except Exception as exc:
+                raise ModelUnavailableError(f"paraformer-zh 本地转写失败: {exc}") from exc
+        return recognition_tokens_from_model_result(
+            result,
             time_offset_ms=window_start_ms,
             timestamps_in_seconds=self.timestamps_in_seconds,
         )
@@ -1439,6 +1512,7 @@ __all__ = [
     "AlignmentCancelledError",
     "AlignmentCandidate",
     "AlignmentTrack",
+    "RecognizedToken",
     "AsrAligner",
     "ForceAligner",
     "FunASRAsrAligner",
@@ -1449,4 +1523,5 @@ __all__ = [
     "alignment_track_from_model_result",
     "normalize_text",
     "normalize_with_mapping",
+    "recognition_tokens_from_model_result",
 ]

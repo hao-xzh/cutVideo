@@ -43,8 +43,19 @@ class WaveformWidget(QWidget):
         self._pan_press_x = 0.0
         self._pan_view_start = 0
         self._pan_view_end = 1
+        self._selection_drawing_enabled = False
+        self._selection_anchor = 0
         self._placeholder = "完成分析后将在这里显示局部波形"
         self.setToolTip("拖动空白波形可前后平移；滚轮缩放；橙色边界可直接拖动。")
+
+    def set_selection_drawing_enabled(self, enabled: bool) -> None:
+        """Let blank-area drags draw a range; Alt+drag remains available for panning."""
+
+        self._selection_drawing_enabled = bool(enabled)
+        if enabled:
+            self.setToolTip("拖动波形可框选试听范围；Alt+拖动平移；滚轮缩放。")
+        else:
+            self.setToolTip("拖动空白波形可前后平移；滚轮缩放；橙色边界可直接拖动。")
 
     @property
     def selection(self) -> tuple[int, int]:
@@ -302,6 +313,19 @@ class WaveformWidget(QWidget):
             self.setCursor(Qt.CursorShape.SizeHorCursor)
             event.accept()
             return
+        if self._selection_drawing_enabled and not (
+            event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            sample = max(0, min(self._total_samples - 1, self._x_to_sample(x)))
+            self._selection_anchor = sample
+            self._selection_start = sample
+            self._selection_end = min(self._total_samples, sample + 1)
+            self._dragging = "select"
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.boundariesChanged.emit(self._selection_start, self._selection_end)
+            self.update()
+            event.accept()
+            return
         self._dragging = "pan"
         self._pan_press_x = x
         self._pan_view_start = self._view_start
@@ -335,7 +359,13 @@ class WaveformWidget(QWidget):
             return
         sample = self._x_to_sample(event.position().x(), clamp_to_view=False)
         sample = max(0, min(self._total_samples, sample))
-        if self._dragging == "start":
+        if self._dragging == "select":
+            anchor = self._selection_anchor
+            self._selection_start = min(anchor, max(0, min(self._total_samples - 1, sample)))
+            self._selection_end = max(anchor + 1, min(self._total_samples, sample))
+            if sample < anchor:
+                self._selection_end = min(self._total_samples, anchor + 1)
+        elif self._dragging == "start":
             self._selection_start = max(
                 0,
                 min(self._selection_end - 1, sample),
@@ -353,7 +383,7 @@ class WaveformWidget(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._dragging is not None and event.button() is Qt.MouseButton.LeftButton:
-            finished_boundary_drag = self._dragging in {"start", "end"}
+            finished_boundary_drag = self._dragging in {"start", "end", "select"}
             self._dragging = None
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             if finished_boundary_drag:

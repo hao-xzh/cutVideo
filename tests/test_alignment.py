@@ -25,6 +25,7 @@ from cutvideo.alignment import (
     align_transcript,
     alignment_track_from_model_result,
     normalize_with_mapping,
+    recognition_tokens_from_model_result,
 )
 from cutvideo.model_runtime import ModelUnavailableError, load_funasr_model
 
@@ -465,6 +466,18 @@ def test_asr_homophone_substitution_keeps_highlight_character_timestamp() -> Non
     assert highlighted_span.confidence == 0.9
 
 
+def test_raw_recognition_tokens_keep_absolute_timestamps() -> None:
+    tokens = recognition_tokens_from_model_result(
+        [{"text": "你好", "timestamp": [[0, 100], [100, 240]]}],
+        time_offset_ms=2_000,
+    )
+
+    assert [(item.text, item.start_ms, item.end_ms) for item in tokens] == [
+        ("你", 2_000, 2_100),
+        ("好", 2_100, 2_240),
+    ]
+
+
 def test_highlight_range_rejects_sparse_matches_across_large_audio_hole() -> None:
     track = AlignmentTrack(
         (
@@ -670,3 +683,12 @@ def test_asr_adapter_explicitly_requests_timestamps(
     assert calls[0]["use_itn"] is False
     assert factory_options["vad_kwargs"] == {"max_single_segment_time": 30_000}
     assert track.coverage == 1.0
+
+    recognized = aligner.recognize(
+        audio_path=tmp_path / "source.wav",
+        window_start_ms=200,
+        window_end_ms=400,
+    )
+    assert [(item.text, item.start_ms, item.end_ms) for item in recognized] == [
+        ("甲", 200, 300)
+    ]

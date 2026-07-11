@@ -8,11 +8,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 from PySide6.QtCore import QDir, QPoint, Qt
+from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from cutvideo.app import create_application
 from cutvideo.audio import WaveformEnvelope
+from cutvideo.audio_processing import AudioProcessingProject, TranscriptToken
+from cutvideo.project import AudioInfo as ProjectAudioInfo
+from cutvideo.project import SourceFile
 from cutvideo.ui.main_window import MainWindow
 from cutvideo.ui.waveform import WaveformWidget, _waveform_buckets
 
@@ -22,9 +26,14 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
     assert isinstance(app, QApplication)
     window = MainWindow()
     try:
-        assert window.windowTitle() == "离线 Word 黄标音频剪辑器"
+        assert window.windowTitle() == "离线音频剪辑器"
+        assert window.workspace_tabs.count() == 2
+        assert window.workspace_tabs.tabText(0) == "Word 黄标剪辑"
+        assert window.workspace_tabs.tabText(1) == "音频处理"
+        assert window.audio_processing_widget.add_delete_button.text() == "标注为删除"
+        assert window.audio_processing_widget.preview_selection_button.text() == "试听框选"
         assert not app.windowIcon().isNull()
-        assert window.centralWidget().objectName() == "mainScrollArea"
+        assert window.centralWidget().objectName() == "workspaceTabs"
         assert window.step_labels[0].property("stepState") == "active"
         assert Path(window._preview_directory.path()).parent == Path(QDir.tempPath())
         assert window.audio_path_edit.objectName() == "audioPathEdit"
@@ -46,6 +55,39 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
         assert window.review_all_button.objectName() == "reviewAllButton"
         assert window.export_button.objectName() == "exportButton"
         assert not window.export_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_audio_processing_text_selection_creates_delete_annotation(tmp_path: Path) -> None:
+    create_application(["cutvideo-test"])
+    source = tmp_path / "source.wav"
+    source.write_bytes(b"audio")
+    window = MainWindow()
+    try:
+        workspace = window.audio_processing_widget
+        workspace.project = AudioProcessingProject(
+            audio=SourceFile.from_path(source),
+            audio_info=ProjectAudioInfo(1_000, 1, 5_000, "wav", "pcm_s16le"),
+            tokens=[
+                TranscriptToken("你", 1_000, 1_200),
+                TranscriptToken("好", 1_200, 1_450),
+                TranscriptToken("啊", 1_450, 1_700),
+            ],
+            output_directory=str(tmp_path),
+        )
+        workspace.project_path = tmp_path / "source.audioprocess.json"
+        workspace._render_transcript()
+        cursor = workspace.transcript_edit.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
+        workspace.transcript_edit.setTextCursor(cursor)
+
+        workspace._add_delete_annotation()
+
+        assert len(workspace.project.annotations) == 1
+        assert workspace.project.annotations[0].text == "你好"
+        assert workspace.annotation_table.rowCount() == 1
     finally:
         window.close()
 
@@ -117,6 +159,24 @@ def test_dragging_boundary_near_edge_auto_pans_the_waveform() -> None:
 
         assert widget.selection[1] > 6_300
         assert widget.view_range[1] > 6_500
+    finally:
+        widget.close()
+
+
+def test_waveform_can_draw_a_new_selection_in_audio_processing_mode() -> None:
+    create_application(["cutvideo-test"])
+    widget = WaveformWidget()
+    widget.resize(600, 200)
+    widget.set_envelope(_interactive_envelope(), 10_000)
+    widget.set_selection_drawing_enabled(True)
+    widget.show()
+    try:
+        QTest.mousePress(widget, Qt.MouseButton.LeftButton, pos=QPoint(120, 100))
+        QTest.mouseMove(widget, QPoint(360, 100))
+        QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, pos=QPoint(360, 100))
+        start, end = widget.selection
+        assert 0 <= start < end <= 10_000
+        assert end - start > 1_000
     finally:
         widget.close()
 
