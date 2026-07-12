@@ -125,15 +125,21 @@ def test_audio_processing_text_selection_creates_delete_annotation(tmp_path: Pat
                 TranscriptToken("好", 1_200, 1_450),
                 TranscriptToken("啊", 1_450, 1_700),
             ],
+            segment_starts=[0, 2],
             output_directory=str(tmp_path),
         )
         workspace.project_path = tmp_path / "source.audioprocess.json"
         workspace.waveform_envelope = _interactive_envelope()
         workspace.waveform.set_envelope(workspace.waveform_envelope, 5_000)
         workspace._render_transcript()
+        assert workspace.transcript_edit.toPlainText() == "[00:01.000] 你好\n[00:01.450] 啊"
+        assert len(workspace._segment_label_ranges) == 2
         cursor = workspace.transcript_edit.textCursor()
-        cursor.setPosition(0)
-        cursor.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(workspace._token_document_ranges[0][0])
+        cursor.setPosition(
+            workspace._token_document_ranges[1][1],
+            QTextCursor.MoveMode.KeepAnchor,
+        )
         workspace.transcript_edit.setTextCursor(cursor)
         workspace.waveform.set_selection(900, 1_550, center=False)
 

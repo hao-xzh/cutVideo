@@ -5,6 +5,7 @@ from pathlib import Path
 from cutvideo.audio_processing import (
     AudioProcessingProject,
     TranscriptToken,
+    infer_transcript_segment_starts,
     load_audio_processing_project,
     save_audio_processing_project,
 )
@@ -41,6 +42,18 @@ def test_audio_processing_project_round_trip(tmp_path: Path) -> None:
     assert loaded.annotations[0].text == "你好"
     assert loaded.annotations[0].start_sample == 980
     assert loaded.deletion_intervals[0].operation == "delete"
+    assert loaded.segment_starts == [0, 2]
+
+
+def test_legacy_transcript_segments_use_silence_and_maximum_duration() -> None:
+    tokens = [
+        TranscriptToken("甲", 0, 200),
+        TranscriptToken("乙", 250, 450),
+        TranscriptToken("丙", 1_000, 1_200),
+        TranscriptToken("丁", 31_500, 31_700),
+    ]
+
+    assert infer_transcript_segment_starts(tokens, 1_000) == [0, 2, 3]
 
 
 def test_overlapping_delete_annotations_are_merged(tmp_path: Path) -> None:

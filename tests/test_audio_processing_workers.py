@@ -46,6 +46,11 @@ def test_audio_processing_analysis_builds_sample_exact_transcript_project(
         lambda *_args, **_kwargs: AudioInfo(audio, 1_000, 1, 5_000, 5.0, "pcm"),
     )
     monkeypatch.setattr(workers, "FunASRAsrAligner", FakeRecognizer)
+    monkeypatch.setattr(
+        workers,
+        "_detect_voice_ranges",
+        lambda *_args, **_kwargs: ((900.0, 1_600.0),),
+    )
 
     result = workers.make_audio_processing_analysis_operation(str(audio))(
         CancelToken(),
@@ -59,6 +64,30 @@ def test_audio_processing_analysis_builds_sample_exact_transcript_project(
     ]
     assert result.project_path.name == "standalone.audioprocess.json"
     assert result.project_path.is_file()
+    assert result.project.segment_starts == [0]
+
+
+def test_vad_ranges_create_transcript_line_starts() -> None:
+    tokens = [
+        TranscriptToken("甲", 1_000, 1_200),
+        TranscriptToken("乙", 1_200, 1_400),
+        TranscriptToken("丙", 2_100, 2_300),
+        TranscriptToken("丁", 2_300, 2_500),
+    ]
+
+    starts = workers._segment_starts_from_voice_ranges(
+        tokens,
+        ((900.0, 1_500.0), (2_000.0, 2_600.0)),
+        1_000,
+    )
+
+    assert starts == [0, 2]
+
+
+def test_vad_result_parser_accepts_funasr_value_shape() -> None:
+    result = [{"key": "audio", "value": [[90, 800], [1_200, 2_500]]}]
+
+    assert workers._voice_ranges_from_result(result) == ((90.0, 800.0), (1_200.0, 2_500.0))
 
 
 def test_audio_processing_export_uses_delete_annotations_and_expected_names(

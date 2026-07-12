@@ -87,6 +87,7 @@ class AudioProcessingWidget(QWidget):
         self.waveform_envelope: WaveformEnvelope | None = None
         self._active_task: BackgroundTask | None = None
         self._token_document_ranges: list[tuple[int, int]] = []
+        self._segment_label_ranges: list[tuple[int, int]] = []
         self._editing_annotation_id: str | None = None
         self._updating = False
         self._shortcuts: list[QShortcut] = []
@@ -405,7 +406,8 @@ class AudioProcessingWidget(QWidget):
         self._populate_annotations()
         duration = _format_sample(value.audio_info.total_samples, value.audio_info.sample_rate)
         self.summary_label.setText(
-            f"{len(value.project.tokens)} 个带时间戳文字 · 音频 {duration} · "
+            f"{len(value.project.tokens)} 个带时间戳文字 · "
+            f"{len(value.project.segment_starts)} 个人声段 · 音频 {duration} · "
             f"{len(value.project.annotations)} 个删除标注"
         )
         self.statusMessage.emit(
@@ -440,22 +442,24 @@ class AudioProcessingWidget(QWidget):
         parts: list[str] = []
         ranges: list[tuple[int, int]] = []
         position = 0
-        line_characters = 0
-        previous_end = 0
-        sample_rate = self.project.audio_info.sample_rate
+        segment_label_ranges: list[tuple[int, int]] = []
+        segment_starts = set(self.project.segment_starts)
         for index, token in enumerate(self.project.tokens):
-            gap = (token.start_sample - previous_end) / sample_rate if index else 0.0
-            if index and (gap >= 0.75 or line_characters >= 42):
-                parts.append("\n")
-                position += 1
-                line_characters = 0
+            if index in segment_starts:
+                if index:
+                    parts.append("\n")
+                    position += 1
+                label = f"[{_format_sample(token.start_sample, self.project.audio_info.sample_rate)}] "
+                label_start = position
+                parts.append(label)
+                position += len(label)
+                segment_label_ranges.append((label_start, position))
             start = position
             parts.append(token.text)
             position += len(token.text)
             ranges.append((start, position))
-            line_characters += len(token.text)
-            previous_end = token.end_sample
         self._token_document_ranges = ranges
+        self._segment_label_ranges = segment_label_ranges
         with QSignalBlocker(self.transcript_edit):
             self.transcript_edit.setPlainText("".join(parts))
         self._refresh_transcript_formats()
@@ -590,7 +594,9 @@ class AudioProcessingWidget(QWidget):
         if selected_row >= 0:
             self.annotation_table.selectRow(selected_row)
         self.summary_label.setText(
-            f"{len(self.project.tokens)} 个带时间戳文字 · {len(self.project.annotations)} 个删除标注"
+            f"{len(self.project.tokens)} 个带时间戳文字 · "
+            f"{len(self.project.segment_starts)} 个人声段 · "
+            f"{len(self.project.annotations)} 个删除标注"
         )
         self._refresh_controls()
 
@@ -692,6 +698,17 @@ class AudioProcessingWidget(QWidget):
             self.transcript_edit.setExtraSelections([])
             return
         selections: list[QTextEdit.ExtraSelection] = []
+        for start, end in self._segment_label_ranges:
+            selection = QTextEdit.ExtraSelection()
+            cursor = self.transcript_edit.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            selection.cursor = cursor
+            formatting = QTextCharFormat()
+            formatting.setForeground(QBrush(QColor("#6b7b91")))
+            formatting.setFontFixedPitch(True)
+            selection.format = formatting
+            selections.append(selection)
         for annotation in self.project.annotations:
             if not (0 <= annotation.token_start < annotation.token_end <= len(self._token_document_ranges)):
                 continue

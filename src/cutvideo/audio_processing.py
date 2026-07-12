@@ -17,6 +17,8 @@ from .project import AudioInfo, ProjectIOError, ProjectValidationError, SourceFi
 
 AUDIO_PROCESSING_SCHEMA: Final = "cutvideo.audio_processing"
 AUDIO_PROCESSING_VERSION: Final = 1
+DEFAULT_SEGMENT_SILENCE_SECONDS: Final = 0.5
+DEFAULT_MAX_SEGMENT_SECONDS: Final = 30.0
 
 
 def _now() -> str:
@@ -59,6 +61,30 @@ class TranscriptToken:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectValidationError("转写 token 字段无效") from exc
+
+
+def infer_transcript_segment_starts(
+    tokens: list[TranscriptToken],
+    sample_rate: int,
+    *,
+    silence_seconds: float = DEFAULT_SEGMENT_SILENCE_SECONDS,
+    max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
+) -> list[int]:
+    """Infer stable speech-line starts for projects created before VAD persistence."""
+
+    if not tokens or sample_rate <= 0:
+        return []
+    silence_samples = round(sample_rate * silence_seconds)
+    max_segment_samples = round(sample_rate * max_segment_seconds)
+    starts = [0]
+    segment_start_sample = tokens[0].start_sample
+    for index in range(1, len(tokens)):
+        token = tokens[index]
+        gap = token.start_sample - tokens[index - 1].end_sample
+        if gap >= silence_samples or token.start_sample - segment_start_sample >= max_segment_samples:
+            starts.append(index)
+            segment_start_sample = token.start_sample
+    return starts
 
 
 @dataclass(slots=True)
@@ -117,6 +143,7 @@ class AudioProcessingProject:
     audio: SourceFile
     audio_info: AudioInfo
     tokens: list[TranscriptToken]
+    segment_starts: list[int] = field(default_factory=list)
     annotations: list[AudioAnnotation] = field(default_factory=list)
     output_directory: str = ""
     app_version: str = __version__
@@ -134,6 +161,17 @@ class AudioProcessingProject:
             if token.start_sample < previous_start:
                 raise ProjectValidationError("转写 token 时间必须递增")
             previous_start = token.start_sample
+        if not self.segment_starts:
+            self.segment_starts = infer_transcript_segment_starts(
+                self.tokens, self.audio_info.sample_rate
+            )
+        if (
+            not self.segment_starts
+            or self.segment_starts[0] != 0
+            or self.segment_starts != sorted(set(self.segment_starts))
+            or self.segment_starts[-1] >= len(self.tokens)
+        ):
+            raise ProjectValidationError("人声分段起点无效")
         ids: set[str] = set()
         for annotation in self.annotations:
             annotation.validate(len(self.tokens), self.audio_info.total_samples)
@@ -200,6 +238,7 @@ class AudioProcessingProject:
             "audio": self.audio.to_dict(),
             "audio_info": self.audio_info.to_dict(),
             "tokens": [item.to_dict() for item in self.tokens],
+            "segment_starts": self.segment_starts,
             "annotations": [item.to_dict() for item in self.annotations],
             "output_directory": self.output_directory,
         }
@@ -217,6 +256,7 @@ class AudioProcessingProject:
                 audio=SourceFile.from_dict(value["audio"], "audio"),
                 audio_info=AudioInfo.from_dict(value["audio_info"]),
                 tokens=[TranscriptToken.from_dict(item) for item in value["tokens"]],
+                segment_starts=[int(item) for item in value.get("segment_starts", [])],
                 annotations=[
                     AudioAnnotation.from_dict(item) for item in value.get("annotations", [])
                 ],
@@ -282,6 +322,7 @@ __all__ = [
     "AudioAnnotation",
     "AudioProcessingProject",
     "TranscriptToken",
+    "infer_transcript_segment_starts",
     "default_audio_processing_project_path",
     "load_audio_processing_project",
     "save_audio_processing_project",
