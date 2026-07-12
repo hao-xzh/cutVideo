@@ -140,14 +140,32 @@ def make_audio_processing_preview_operation(
             raise ValueError("原音频内容发生变化")
         directory = Path(preview_directory)
         directory.mkdir(parents=True, exist_ok=True)
-        original = directory / "audio-processing-selection.wav"
+        original = directory / "audio-processing-original.wav"
+        selection = directory / "audio-processing-selection.wav"
+        selection_copy = directory / "audio-processing-selection-copy.wav"
         edited = directory / "audio-processing-edited.wav"
-        report(0.10, "正在生成本地试听…")
+        padding = round(project.audio_info.sample_rate * 3.0)
+        context_start = max(0, start_sample - padding)
+        context_end = min(project.audio_info.total_samples, end_sample + padding)
+        preview_intervals = [*project.deletion_intervals, (start_sample, end_sample)]
+        report(0.10, "正在生成前后 3 秒试听…")
         generate_preview(
             project.audio.path,
-            project.deletion_intervals,
+            preview_intervals,
             original,
             edited,
+            start_sample=context_start,
+            end_sample=context_end,
+            info=project.audio_info,
+            tools=tools,
+            cancel=token,
+        )
+        report(0.72, "正在生成删除范围试听…")
+        generate_preview(
+            project.audio.path,
+            [],
+            selection,
+            selection_copy,
             start_sample=start_sample,
             end_sample=end_sample,
             info=project.audio_info,
@@ -155,7 +173,7 @@ def make_audio_processing_preview_operation(
             cancel=token,
         )
         report(1.0, "试听已就绪")
-        return CandidatePreviewResult(original, original, edited)
+        return CandidatePreviewResult(original, selection, edited)
 
     return operation
 

@@ -8,6 +8,7 @@ build/
 .build/
 dist/
 dist-debug/
+dist-v*/
 release/
 *.spec
 # User source material must never be committed accidentally.

@@ -1,6 +1,7 @@
 param(
     [switch]$AllowUnpinned,
-    [string]$Python = ".venv311\Scripts\python.exe"
+    [string]$Python = ".venv311\Scripts\python.exe",
+    [string]$DistPath = "dist"
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,7 +45,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     --add-data="$Root\resources;resources" `
     --add-data="$Root\THIRD_PARTY_NOTICES.md;." `
     --add-data="$Root\README.md;." `
-    --distpath=dist `
+    --distpath="$DistPath" `
     --workpath=build\pyinstaller-windows `
     --specpath=build `
     src\cutvideo_launcher.py
@@ -53,7 +54,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $report = Join-Path $env:TEMP "cutvideo-selftest-$PID.json"
 $env:CUTVIDEO_SELFTEST_REPORT = $report
 $selfTest = Start-Process `
-    -FilePath (Join-Path $Root "dist\CutVideo\CutVideo.exe") `
+    -FilePath (Join-Path $Root "$DistPath\CutVideo\CutVideo.exe") `
     -ArgumentList "--self-test-models" `
     -WindowStyle Hidden `
     -Wait `
@@ -64,4 +65,4 @@ if ($selfTest.ExitCode -ne 0) {
 }
 Get-Content -LiteralPath $report -Encoding UTF8
 Remove-Item -LiteralPath $report -Force
-Write-Host "Standalone application created in dist\CutVideo. Distribute the complete directory."
+Write-Host "Standalone application created in $DistPath\CutVideo. Distribute the complete directory."

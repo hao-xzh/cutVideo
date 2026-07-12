@@ -95,3 +95,47 @@ def test_audio_processing_export_uses_delete_annotations_and_expected_names(
     assert result.mp3_path.name == "standalone_处理完成.mp3"
     assert result.project_path.name == "standalone.audioprocess.json"
     assert len(captured["intervals"]) == 1
+
+
+def test_audio_processing_preview_keeps_three_seconds_of_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    audio = tmp_path / "standalone.wav"
+    audio.write_bytes(b"audio-fixture")
+    project = AudioProcessingProject(
+        audio=SourceFile.from_path(audio),
+        audio_info=ProjectAudioInfo(1_000, 1, 10_000, "wav", "pcm"),
+        tokens=[TranscriptToken("删", 4_000, 4_200), TranscriptToken("除", 4_200, 4_500)],
+        output_directory=str(tmp_path),
+    )
+    project.add_delete_annotation(0, 2)
+    calls: list[dict[str, object]] = []
+
+    def fake_preview(audio_path, intervals, original, edited, **kwargs):
+        calls.append(
+            {
+                "audio": audio_path,
+                "intervals": list(intervals),
+                "original": Path(original),
+                "edited": Path(edited),
+                **kwargs,
+            }
+        )
+
+    monkeypatch.setattr(workers, "generate_preview", fake_preview)
+    result = workers.make_audio_processing_preview_operation(
+        project,
+        start_sample=4_000,
+        end_sample=4_500,
+        tools=FFmpegTools(tmp_path / "ffmpeg", tmp_path / "ffprobe"),
+        preview_directory=tmp_path / "preview",
+    )(CancelToken(), lambda _value, _message: None)
+
+    assert len(calls) == 2
+    assert (calls[0]["start_sample"], calls[0]["end_sample"]) == (1_000, 7_500)
+    assert calls[0]["intervals"][-1] == (4_000, 4_500)
+    assert (calls[1]["start_sample"], calls[1]["end_sample"]) == (4_000, 4_500)
+    assert calls[1]["intervals"] == []
+    assert result.original_wav_path.name == "audio-processing-original.wav"
+    assert result.selection_wav_path.name == "audio-processing-selection.wav"

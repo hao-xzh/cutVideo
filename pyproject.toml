@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cutvideo-offline"
-version = "0.2.1"
+version = "0.2.2"
 description = "Offline DOCX-highlight driven audio editor for Windows and macOS"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"

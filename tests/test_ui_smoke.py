@@ -32,7 +32,8 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
         assert window.workspace_tabs.tabText(0) == "Word 黄标剪辑"
         assert window.workspace_tabs.tabText(1) == "音频处理"
         assert window.audio_processing_widget.add_delete_button.text() == "标注为删除"
-        assert window.audio_processing_widget.preview_selection_button.text() == "试听框选"
+        assert window.audio_processing_widget.preview_original_button.text() == "听原音（前后 3 秒）"
+        assert window.audio_processing_widget.preview_selection_button.text() == "只听删除"
         assert not app.windowIcon().isNull()
         assert window.centralWidget().objectName() == "workspaceTabs"
         assert window.step_labels[0].property("stepState") == "active"
@@ -127,17 +128,28 @@ def test_audio_processing_text_selection_creates_delete_annotation(tmp_path: Pat
             output_directory=str(tmp_path),
         )
         workspace.project_path = tmp_path / "source.audioprocess.json"
+        workspace.waveform_envelope = _interactive_envelope()
+        workspace.waveform.set_envelope(workspace.waveform_envelope, 5_000)
         workspace._render_transcript()
         cursor = workspace.transcript_edit.textCursor()
         cursor.setPosition(0)
         cursor.setPosition(2, QTextCursor.MoveMode.KeepAnchor)
         workspace.transcript_edit.setTextCursor(cursor)
+        workspace.waveform.set_selection(900, 1_550, center=False)
 
         workspace._add_delete_annotation()
 
         assert len(workspace.project.annotations) == 1
         assert workspace.project.annotations[0].text == "你好"
+        assert (
+            workspace.project.annotations[0].start_sample,
+            workspace.project.annotations[0].end_sample,
+        ) == (900, 1_550)
         assert workspace.annotation_table.rowCount() == 1
+        transcript_card = workspace.transcript_edit.parentWidget()
+        detail_card = workspace.waveform.parentWidget()
+        assert not transcript_card.isAncestorOf(workspace.add_delete_button)
+        assert detail_card.isAncestorOf(workspace.add_delete_button)
     finally:
         window.close()
 
