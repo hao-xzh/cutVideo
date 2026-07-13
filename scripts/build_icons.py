@@ -2,24 +2,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QGuiApplication, QImage
 
 ROOT = Path(__file__).resolve().parents[1]
 ICON_ROOT = ROOT / "resources" / "icons"
+ICON_SOURCE = ICON_ROOT / "app-icon-source.png"
 
 
 def render_icon(size: int) -> QImage:
-    renderer = QSvgRenderer(str(ICON_ROOT / "app-icon.svg"))
-    if not renderer.isValid():
-        raise RuntimeError("invalid app-icon.svg")
-    image = QImage(QSize(size, size), QImage.Format.Format_ARGB32_Premultiplied)
-    image.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(image)
-    renderer.render(painter, QRectF(0, 0, size, size))
-    painter.end()
-    return image
+    source = QImage(str(ICON_SOURCE))
+    if source.isNull():
+        raise RuntimeError(f"invalid app icon source: {ICON_SOURCE}")
+    return source.scaled(
+        QSize(size, size),
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 def main() -> int:

@@ -1,0 +1,33 @@
+ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+built with Apple clang version 17.0.0 (clang-1700.3.19.1)
+configuration: --prefix=/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/ffmpeg-macos-arm64/install --arch=arm64 --target-os=darwin --cc=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang --disable-autodetect --disable-doc --disable-debug --disable-network --disable-ffplay --disable-shared --enable-static --enable-libmp3lame --extra-cflags='-I/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/lame-macos-arm64/install/include -mmacosx-version-min=13.0' --extra-ldflags='-L/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/lame-macos-arm64/install/lib -mmacosx-version-min=13.0'
+libavutil      60. 26.102 / 60. 26.102
+libavcodec     62. 28.102 / 62. 28.102
+libavformat    62. 12.102 / 62. 12.102
+libavdevice    62.  3.102 / 62.  3.102
+libavfilter    11. 14.102 / 11. 14.102
+libswscale      9.  5.102 /  9.  5.102
+libswresample   6.  3.102 /  6.  3.102
+
+Exiting with exit code 0
+
+  configuration:
+    --prefix=/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/ffmpeg-macos-arm64/install
+    --arch=arm64
+    --target-os=darwin
+    --cc=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang
+    --disable-autodetect
+    --disable-doc
+    --disable-debug
+    --disable-network
+    --disable-ffplay
+    --disable-shared
+    --enable-static
+    --enable-libmp3lame
+    --extra-cflags='-I/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/lame-macos-arm64/install/include -mmacosx-version-min=13.0'
+    --extra-ldflags='-L/Users/shengpeng/Documents/Codex/2026-07-12/new-chat/cutVideo/.build/lame-macos-arm64/install/lib -mmacosx-version-min=13.0'
+
+Exiting with exit code 0
+
+Dynamically linked LAME dependency:
+	@executable_path/libmp3lame.0.dylib (compatibility version 1.0.0, current version 1.0.0)

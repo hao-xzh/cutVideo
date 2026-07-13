@@ -713,6 +713,8 @@ def generate_preview(
         overwrite=overwrite,
     )
     _run_with_progress(argv, cancel=cancel)
+    _validate_audio_output(original_output, resolved_tools)
+    _validate_audio_output(edited_output, resolved_tools)
     return PreviewResult(original_output, edited_output, tuple(argv))
 
 

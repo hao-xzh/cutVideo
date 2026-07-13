@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from contextlib import suppress
@@ -19,10 +20,62 @@ AUDIO_PROCESSING_SCHEMA: Final = "cutvideo.audio_processing"
 AUDIO_PROCESSING_VERSION: Final = 1
 DEFAULT_SEGMENT_SILENCE_SECONDS: Final = 0.5
 DEFAULT_MAX_SEGMENT_SECONDS: Final = 30.0
+LOW_RAW_CONFIDENCE_THRESHOLD: Final = 0.40
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_diagnostic_value(value: object, label: str, *, depth: int = 0) -> None:
+    """Keep persisted diagnostics finite, JSON-safe and reasonably bounded."""
+
+    if depth > 8:
+        raise ProjectValidationError(f"{label} 嵌套过深")
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProjectValidationError(f"{label} 不能包含 NaN 或无穷值")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_diagnostic_value(item, f"{label}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProjectValidationError(f"{label} 的键必须是字符串")
+            _validate_diagnostic_value(item, f"{label}.{key}", depth=depth + 1)
+        return
+    raise ProjectValidationError(f"{label} 包含不可序列化的诊断值")
+
+
+def _annotation_review_metadata(
+    tokens: list[TranscriptToken],
+) -> tuple[bool, list[str], dict[str, Any]]:
+    precisions = sorted({token.timestamp_precision for token in tokens})
+    confidences = [token.confidence for token in tokens if token.confidence_available]
+    # A model timestamp is only an initial content location.  Even a genuine
+    # character timestamp is not yet an acoustically refined cut boundary.
+    reasons: list[str] = ["boundary_precision_unverified"]
+    if any(token.timestamp_precision != "character" for token in tokens):
+        reasons.append("coarse_timestamp")
+    if len(confidences) != len(tokens):
+        reasons.append("model_confidence_unavailable")
+    if confidences and min(confidences) < LOW_RAW_CONFIDENCE_THRESHOLD:
+        reasons.append("low_model_confidence")
+    diagnostics: dict[str, Any] = {
+        "boundary_source": "model_timestamp",
+        "timestamp_precisions": precisions,
+        "selected_token_count": len(tokens),
+        "raw_confidence_available_count": len(confidences),
+        "raw_confidence_mean": (
+            round(sum(confidences) / len(confidences), 4) if confidences else None
+        ),
+        "raw_confidence_minimum": round(min(confidences), 4) if confidences else None,
+    }
+    return True, reasons, diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,14 +84,20 @@ class TranscriptToken:
     start_sample: int
     end_sample: int
     confidence: float = 1.0
+    confidence_available: bool = False
+    timestamp_precision: str = "unknown"
 
     def validate(self, total_samples: int) -> None:
         if not self.text:
             raise ProjectValidationError("转写文字不能为空")
         if not 0 <= self.start_sample < self.end_sample <= total_samples:
             raise ProjectValidationError("转写文字的样本范围无效")
-        if not 0.0 <= self.confidence <= 1.0:
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
             raise ProjectValidationError("转写置信度必须位于 0 到 1")
+        if not isinstance(self.confidence_available, bool):
+            raise ProjectValidationError("转写置信度可用状态必须是布尔值")
+        if self.timestamp_precision not in {"character", "token", "segment", "unknown"}:
+            raise ProjectValidationError("转写时间戳精度无效")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +105,8 @@ class TranscriptToken:
             "start_sample": self.start_sample,
             "end_sample": self.end_sample,
             "confidence": self.confidence,
+            "confidence_available": self.confidence_available,
+            "timestamp_precision": self.timestamp_precision,
         }
 
     @classmethod
@@ -58,6 +119,8 @@ class TranscriptToken:
                 start_sample=int(value["start_sample"]),
                 end_sample=int(value["end_sample"]),
                 confidence=float(value.get("confidence", 1.0)),
+                confidence_available=value.get("confidence_available", False),
+                timestamp_precision=str(value.get("timestamp_precision", "unknown")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectValidationError("转写 token 字段无效") from exc
@@ -96,6 +159,11 @@ class AudioAnnotation:
     token_end: int
     start_sample: int
     end_sample: int
+    review_required: bool = True
+    review_reasons: list[str] = field(
+        default_factory=lambda: ["boundary_precision_unverified"]
+    )
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def validate(self, token_count: int, total_samples: int) -> None:
         if not self.id:
@@ -108,6 +176,17 @@ class AudioAnnotation:
             raise ProjectValidationError("标注 token 范围无效")
         if not 0 <= self.start_sample < self.end_sample <= total_samples:
             raise ProjectValidationError("标注音频范围无效")
+        if not isinstance(self.review_required, bool):
+            raise ProjectValidationError("标注复核状态必须是布尔值")
+        if not isinstance(self.review_reasons, list) or any(
+            not isinstance(item, str) or not item for item in self.review_reasons
+        ):
+            raise ProjectValidationError("标注复核原因必须是非空字符串数组")
+        if self.review_required and not self.review_reasons:
+            raise ProjectValidationError("待复核标注必须保存复核原因")
+        if not isinstance(self.diagnostics, dict):
+            raise ProjectValidationError("标注诊断信息必须是对象")
+        _validate_diagnostic_value(self.diagnostics, "annotation.diagnostics")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,13 +197,24 @@ class AudioAnnotation:
             "token_end": self.token_end,
             "start_sample": self.start_sample,
             "end_sample": self.end_sample,
+            "review_required": self.review_required,
+            "review_reasons": list(self.review_reasons),
+            "diagnostics": dict(self.diagnostics),
         }
 
     @classmethod
     def from_dict(cls, value: object) -> AudioAnnotation:
         if not isinstance(value, dict):
             raise ProjectValidationError("音频标注必须是对象")
+        legacy_review = "review_required" not in value
         try:
+            raw_reasons = value.get(
+                "review_reasons",
+                ["legacy_boundary_precision_unknown"] if legacy_review else [],
+            )
+            raw_diagnostics = value.get("diagnostics", {})
+            if not isinstance(raw_reasons, list) or not isinstance(raw_diagnostics, dict):
+                raise TypeError
             return cls(
                 id=str(value["id"]),
                 operation=str(value["operation"]),
@@ -133,6 +223,9 @@ class AudioAnnotation:
                 token_end=int(value["token_end"]),
                 start_sample=int(value["start_sample"]),
                 end_sample=int(value["end_sample"]),
+                review_required=value.get("review_required", True),
+                review_reasons=list(raw_reasons),
+                diagnostics=dict(raw_diagnostics),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectValidationError("音频标注字段无效") from exc
@@ -145,6 +238,7 @@ class AudioProcessingProject:
     tokens: list[TranscriptToken]
     segment_starts: list[int] = field(default_factory=list)
     annotations: list[AudioAnnotation] = field(default_factory=list)
+    analysis_diagnostics: dict[str, Any] = field(default_factory=dict)
     output_directory: str = ""
     app_version: str = __version__
     created_at: str = field(default_factory=_now)
@@ -156,11 +250,13 @@ class AudioProcessingProject:
         if not self.tokens:
             raise ProjectValidationError("完整音频没有识别出可编辑文字")
         previous_start = -1
+        previous_end = -1
         for token in self.tokens:
             token.validate(self.audio_info.total_samples)
-            if token.start_sample < previous_start:
+            if token.start_sample < previous_start or token.end_sample < previous_end:
                 raise ProjectValidationError("转写 token 时间必须递增")
             previous_start = token.start_sample
+            previous_end = token.end_sample
         if not self.segment_starts:
             self.segment_starts = infer_transcript_segment_starts(
                 self.tokens, self.audio_info.sample_rate
@@ -178,6 +274,12 @@ class AudioProcessingProject:
             if annotation.id in ids:
                 raise ProjectValidationError("标注 id 重复")
             ids.add(annotation.id)
+        if not isinstance(self.analysis_diagnostics, dict):
+            raise ProjectValidationError("音频分析诊断信息必须是对象")
+        _validate_diagnostic_value(
+            self.analysis_diagnostics,
+            "analysis_diagnostics",
+        )
         if not self.output_directory:
             raise ProjectValidationError("导出目录不能为空")
 
@@ -205,6 +307,9 @@ class AudioProcessingProject:
             self.annotations = [item for item in self.annotations if item.id not in merged_ids]
         else:
             annotation_id = f"d-{uuid4().hex[:12]}"
+        review_required, review_reasons, diagnostics = _annotation_review_metadata(
+            self.tokens[token_start:token_end]
+        )
         annotation = AudioAnnotation(
             id=annotation_id,
             operation="delete",
@@ -213,11 +318,41 @@ class AudioProcessingProject:
             token_end=token_end,
             start_sample=start_sample,
             end_sample=end_sample,
+            review_required=review_required,
+            review_reasons=review_reasons,
+            diagnostics=diagnostics,
         )
         self.annotations.append(annotation)
         self.annotations.sort(key=lambda item: (item.start_sample, item.end_sample))
         self.updated_at = _now()
         return annotation
+
+    def mark_annotation_boundary_reviewed(
+        self,
+        annotation_id: str,
+        *,
+        source: str,
+    ) -> bool:
+        """Persist an explicit human boundary confirmation or adjustment."""
+
+        if not source.strip():
+            raise ProjectValidationError("边界复核来源不能为空")
+        annotation = next(
+            (item for item in self.annotations if item.id == annotation_id),
+            None,
+        )
+        if annotation is None:
+            return False
+        annotation.review_required = False
+        annotation.review_reasons = []
+        annotation.diagnostics = {
+            **annotation.diagnostics,
+            "boundary_source": source,
+            "manual_review_confirmed": True,
+            "reviewed_at": _now(),
+        }
+        self.updated_at = _now()
+        return True
 
     def remove_annotation(self, annotation_id: str) -> bool:
         before = len(self.annotations)
@@ -240,6 +375,7 @@ class AudioProcessingProject:
             "tokens": [item.to_dict() for item in self.tokens],
             "segment_starts": self.segment_starts,
             "annotations": [item.to_dict() for item in self.annotations],
+            "analysis_diagnostics": dict(self.analysis_diagnostics),
             "output_directory": self.output_directory,
         }
 
@@ -260,6 +396,7 @@ class AudioProcessingProject:
                 annotations=[
                     AudioAnnotation.from_dict(item) for item in value.get("annotations", [])
                 ],
+                analysis_diagnostics=dict(value.get("analysis_diagnostics", {})),
                 output_directory=str(value["output_directory"]),
                 app_version=str(value.get("app_version", "")),
                 created_at=str(value.get("created_at", "")),

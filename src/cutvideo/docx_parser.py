@@ -9,6 +9,7 @@ available before the (much larger) speech models are loaded.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -24,8 +25,11 @@ DEFAULT_CONTEXT_CHARS: Final = 12
 # This intentionally does not match a date or a timestamp embedded in ordinary
 # prose.  Elapsed hours may be 00-99, while minutes must be 00-59.
 _ANCHOR_RE: Final = re.compile(
-    r"^[\t \u00a0\u3000]*\u53d1\u8a00\u4eba[\t \u00a0\u3000]+"
-    r"(?P<minute>[0-9]{2}):(?P<second>[0-5][0-9])"
+    r"^[\t \u00a0\u3000]*\u53d1\u8a00\u4eba"
+    r"(?:[\t \u00a0\u3000]+(?P<speaker>[^\d:\r\n]{1,40}?))?"
+    r"[\t \u00a0\u3000]+(?:"
+    r"(?P<hour>[0-9]{1,3}):(?P<hour_minute>[0-5][0-9]):(?P<hour_second>[0-5][0-9])"
+    r"|(?P<minute>[0-9]{1,3}):(?P<second>[0-5][0-9]))"
     r"[\t \u00a0\u3000]*$"
 )
 
@@ -43,6 +47,7 @@ class HighlightSpan:
     text: str
     context_before: str
     context_after: str
+    source_highlight_index: int = 0
 
     @property
     def length(self) -> int:
@@ -62,6 +67,7 @@ class TranscriptParagraph:
     # fields only.
     source_paragraph_index: int | None = None
     anchor_source_paragraph_index: int | None = None
+    skipped_highlights: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def anchor_seconds(self) -> float:
@@ -82,6 +88,16 @@ class ParsedTranscript:
     @property
     def highlighted_char_count(self) -> int:
         return sum(span.length for span in self.highlights)
+
+    @property
+    def skipped_highlights(self) -> list[dict[str, object]]:
+        diagnostics: list[dict[str, object]] = []
+        for paragraph in self.paragraphs:
+            diagnostics.extend(
+                {"paragraph_index": paragraph.index, **item}
+                for item in paragraph.skipped_highlights
+            )
+        return diagnostics
 
     def validate_audio_duration(self, duration_ms: int) -> None:
         """Ensure all anchors fit inside a decoded audio timeline."""
@@ -233,6 +249,11 @@ def _parse_anchor(text: str) -> int | None:
     match = _ANCHOR_RE.fullmatch(text)
     if match is None:
         return None
+    if match.group("hour") is not None:
+        hours = int(match.group("hour"))
+        minutes = int(match.group("hour_minute"))
+        seconds = int(match.group("hour_second"))
+        return (hours * 3600 + minutes * 60 + seconds) * 1000
     minutes = int(match.group("minute"))
     seconds = int(match.group("second"))
     return (minutes * 60 + seconds) * 1000
@@ -257,12 +278,24 @@ def _build_paragraph(index: int, anchor: _RawAnchor) -> TranscriptParagraph:
 
     text = "".join(text_chunks)
     highlights: list[HighlightSpan] = []
-    for start, end in raw_spans:
+    skipped_highlights: list[dict[str, object]] = []
+    for source_highlight_index, (start, end) in enumerate(raw_spans):
         marked = text[start:end]
         if not marked.strip():
             raise DocxParseError(
                 f"第 {index + 1} 段存在空白的黄色标记（字符 {start}:{end}）"
             )
+        if not _contains_alignable_text(marked):
+            skipped_highlights.append(
+                {
+                    "source_highlight_index": source_highlight_index,
+                    "start": start,
+                    "end": end,
+                    "text": marked,
+                    "reason": "punctuation_only_highlight",
+                }
+            )
+            continue
         highlights.append(
             HighlightSpan(
                 start=start,
@@ -270,6 +303,7 @@ def _build_paragraph(index: int, anchor: _RawAnchor) -> TranscriptParagraph:
                 text=marked,
                 context_before=text[max(0, start - DEFAULT_CONTEXT_CHARS) : start],
                 context_after=text[end : end + DEFAULT_CONTEXT_CHARS],
+                source_highlight_index=source_highlight_index,
             )
         )
 
@@ -280,7 +314,18 @@ def _build_paragraph(index: int, anchor: _RawAnchor) -> TranscriptParagraph:
         highlights=highlights,
         source_paragraph_index=anchor.body[0].source_index,
         anchor_source_paragraph_index=anchor.source_index,
+        skipped_highlights=skipped_highlights,
     )
+
+
+def _contains_alignable_text(text: str) -> bool:
+    """Return whether a yellow span contains speech-matchable characters."""
+
+    for character in unicodedata.normalize("NFKC", text):
+        category = unicodedata.category(character)
+        if not character.isspace() and category[0] not in {"P", "S", "C", "Z"}:
+            return True
+    return False
 
 
 def _format_ms(milliseconds: int) -> str:

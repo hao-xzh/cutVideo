@@ -31,4 +31,14 @@ def remember_dialog_path(key: str, selected_path: str) -> None:
         _settings().setValue(f"dialogs/{key}", str(directory.resolve()))
 
 
-__all__ = ["dialog_start", "remember_dialog_path"]
+def preferred_theme() -> str:
+    value = str(_settings().value("appearance/theme", "dark") or "dark").casefold()
+    return "light" if value == "light" else "dark"
+
+
+def remember_theme(theme: str) -> None:
+    normalized = "light" if str(theme).casefold() == "light" else "dark"
+    _settings().setValue("appearance/theme", normalized)
+
+
+__all__ = ["dialog_start", "preferred_theme", "remember_dialog_path", "remember_theme"]

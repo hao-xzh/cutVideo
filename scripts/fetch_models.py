@@ -37,9 +37,12 @@ def tree_hash(directory: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch release-time FunASR model assets")
-    parser.add_argument("models", nargs="*", choices=sorted(MODELS), default=None)
+    parser.add_argument("models", nargs="*", metavar="MODEL")
     parser.add_argument("--accept-model-licenses", action="store_true", required=True)
     args = parser.parse_args()
+    unknown = sorted(set(args.models) - set(MODELS))
+    if unknown:
+        parser.error(f"unknown model(s): {', '.join(unknown)}; choose from {', '.join(sorted(MODELS))}")
 
     try:
         from modelscope import snapshot_download

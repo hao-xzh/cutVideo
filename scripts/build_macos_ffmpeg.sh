@@ -14,14 +14,15 @@ EXPECTED_SHA256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524
 BUILD_ROOT="$ROOT/.build/ffmpeg-macos-arm64"
 SOURCE_ROOT="$BUILD_ROOT/ffmpeg-${VERSION}"
 OUTPUT_ROOT="$ROOT/resources/bin/macos-arm64"
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+PYTHON_BIN="$(cd "$ROOT" && "${PYTHON:-python3}" -c 'import sys; print(sys.executable)')"
 
 if ! command -v brew >/dev/null 2>&1; then
   echo "Homebrew is required to build the LGPL libmp3lame dependency." >&2
   exit 1
 fi
 brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
-brew list lame >/dev/null 2>&1 || brew install lame
 
 mkdir -p "$BUILD_ROOT"
 if [[ ! -f "$BUILD_ROOT/$ARCHIVE" ]]; then
@@ -35,7 +36,10 @@ fi
 
 rm -rf "$SOURCE_ROOT" "$BUILD_ROOT/install"
 tar -xf "$BUILD_ROOT/$ARCHIVE" -C "$BUILD_ROOT"
-LAME_PREFIX="$(brew --prefix lame)"
+LAME_PREFIX="${CUTVIDEO_LAME_PREFIX:-$ROOT/.build/lame-macos-arm64/install}"
+if [[ ! -f "$LAME_PREFIX/lib/libmp3lame.0.dylib" ]]; then
+  bash "$ROOT/scripts/build_macos_lame.sh"
+fi
 export PKG_CONFIG_PATH="$LAME_PREFIX/lib/pkgconfig"
 
 cd "$SOURCE_ROOT"
@@ -105,10 +109,10 @@ otool -L "$OUTPUT_ROOT/ffmpeg" | grep 'libmp3lame' >> "$ROOT/resources/FFMPEG_BU
 FFMPEG_HASH="$(shasum -a 256 "$OUTPUT_ROOT/ffmpeg" | awk '{print $1}')"
 FFPROBE_HASH="$(shasum -a 256 "$OUTPUT_ROOT/ffprobe" | awk '{print $1}')"
 LAME_HASH="$(shasum -a 256 "$OUTPUT_ROOT/$dylib_name" | awk '{print $1}')"
-LAME_VERSION="$(brew list --versions lame | awk '{print $2; exit}')"
+LAME_VERSION="3.100"
 ROOT="$ROOT" FFMPEG_HASH="$FFMPEG_HASH" FFPROBE_HASH="$FFPROBE_HASH" \
   LAME_FILE="$dylib_name" LAME_HASH="$LAME_HASH" LAME_VERSION="$LAME_VERSION" \
-  "${PYTHON:-python3}" - <<'PY'
+  "$PYTHON_BIN" - <<'PY'
 import json
 import os
 from pathlib import Path

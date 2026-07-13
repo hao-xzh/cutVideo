@@ -12,28 +12,43 @@
       "variant": "win64-lgpl-static"
     },
     "macos-arm64": {
-      "ffmpeg": null,
-      "ffprobe": null
+      "ffmpeg": "88ab10e99bd37250194c0046afdbd604b6486655a0a94afd9aa9c676795f232a",
+      "ffprobe": "380ce345126df9258e5a00be9bf4e306b1ac9a38570b8ecad8b6e70ceeb235fd",
+      "source": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+      "source_code": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz",
+      "archive_sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+      "license": "licenses/LGPL-2.1.txt",
+      "version": "8.1.2",
+      "variant": "macos-arm64-lgpl-static+dynamic-libmp3lame",
+      "lgpl_dependencies": {
+        "libmp3lame": {
+          "file": "libmp3lame.0.dylib",
+          "sha256": "c4b813109475ecd13be929a817919fd4707633ae28c256dc9a48ca08ad3b952d",
+          "version": "3.101",
+          "source_code": "https://sourceforge.net/projects/lame/files/lame/",
+          "license": "licenses/LGPL-LAME.txt"
+        }
+      }
     }
   },
   "models": {
     "fa-zh": {
       "path": "models/fa-zh",
-      "sha256": "7f8bc065b92d957b2d1bdef69aeeaff4cd30a367807247f408b945401a96c87b",
+      "sha256": "6fdfc6aa2953c6fe329e53628115c427cc92c8ff76ed065e31473fa14b139484",
       "license": "licenses/Apache-2.0.txt",
       "source": "iic/speech_timestamp_prediction-v1-16k-offline",
       "revision": "ed6abeae67748098b6055978a17eefd2fa0f9fd6"
     },
     "paraformer-zh": {
       "path": "models/paraformer-zh",
-      "sha256": "9def35448a2533a66c7b9acdaf159b467a7d26b1cd633859c8ec074dd175502d",
+      "sha256": "cc7e76003c30d92c1abae0306500db25c8125f62b020ed4b40c4886f8e3481c5",
       "license": "licenses/Apache-2.0.txt",
       "source": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
       "revision": "6059253cbfda9ea43d6c6f198d38854f09adb298"
     },
     "fsmn-vad": {
       "path": "models/fsmn-vad",
-      "sha256": "3a08ba26f5f4337c4120cc0665cb59599f7b7d445e9a6e24728de2ab9b30a235",
+      "sha256": "5ce8f63e470018810fbb0c2417302aeb4d56251d586025bc75f97a3fd2f217ea",
       "license": "licenses/Apache-2.0.txt",
       "source": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
       "revision": "f9a8b8274674755d925277e27063869038d41515"

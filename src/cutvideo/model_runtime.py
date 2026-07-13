@@ -8,9 +8,12 @@ put into offline mode before importing FunASR.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import wave
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -30,6 +33,31 @@ _OFFLINE_ENVIRONMENT = {
     "MODELSCOPE_OFFLINE": "1",
     "FUNASR_DISABLE_UPDATE": "1",
 }
+_MODEL_EXECUTION_LOCK = threading.RLock()
+_MODEL_CACHE_LOCK = threading.Lock()
+_MODEL_CACHE: dict[tuple[object, ...], Any] = {}
+
+
+def _cancelled(cancel: object | None) -> bool:
+    if cancel is None:
+        return False
+    if callable(cancel):
+        return bool(cancel())
+    is_set = getattr(cancel, "is_set", None)
+    return bool(is_set()) if callable(is_set) else bool(cancel)
+
+
+@contextmanager
+def model_execution_guard(cancel: object | None = None) -> Iterator[None]:
+    """Serialize heavyweight model sessions across both editor workspaces."""
+
+    while not _MODEL_EXECUTION_LOCK.acquire(timeout=0.1):
+        if _cancelled(cancel):
+            raise ModelUnavailableError("模型任务已取消")
+    try:
+        yield
+    finally:
+        _MODEL_EXECUTION_LOCK.release()
 
 
 def configure_offline_environment() -> None:
@@ -78,6 +106,27 @@ def require_local_model(path: str | Path, label: str) -> Path:
     return candidate.resolve()
 
 
+def _freeze_model_option(value: object) -> object:
+    """Turn nested model options into a stable, hashable cache-key value."""
+
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _freeze_model_option(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_model_option(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_model_option(item) for item in value), key=repr))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
 def load_funasr_model(
     *,
     model_path: str | Path,
@@ -87,11 +136,12 @@ def load_funasr_model(
     model_factory: Callable[..., Any] | None = None,
     extra_options: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Create a FunASR ``AutoModel`` from local paths only.
+    """Load or reuse a FunASR ``AutoModel`` from local paths only.
 
     ``model_factory`` is an intentional injection point for tests and for a
     frozen application that exposes AutoModel through a small compatibility
-    shim.  No model name accepted by a remote registry is ever passed here.
+    shim. Injected factories deliberately bypass the process cache. No model
+    name accepted by a remote registry is ever passed here.
     """
 
     local_model = require_local_model(model_path, label)
@@ -101,14 +151,6 @@ def load_funasr_model(
         else None
     )
     configure_offline_environment()
-
-    if model_factory is None:
-        try:
-            with _normalized_windows_dll_directories():
-                from funasr import AutoModel  # type: ignore[import-not-found]
-        except (ImportError, OSError) as exc:
-            raise ModelUnavailableError("FunASR 本地运行库不可用") from exc
-        model_factory = AutoModel
 
     options: dict[str, Any] = {
         "model": str(local_model),
@@ -130,6 +172,34 @@ def load_funasr_model(
     options["disable_log"] = True
     if local_vad is not None:
         options["vad_model"] = str(local_vad)
+
+    if model_factory is None:
+        cache_key = (
+            str(local_model),
+            str(local_vad) if local_vad is not None else "",
+            label,
+            device,
+            _freeze_model_option(extra_options or {}),
+        )
+        # Model deserialization is both slow and memory-heavy. Holding this
+        # lock through construction prevents two workspaces from loading the
+        # same ~GB-scale weights at once. Inference itself is serialized by
+        # ``model_execution_guard`` because FunASR mutates runtime kwargs.
+        with _MODEL_CACHE_LOCK:
+            if cache_key in _MODEL_CACHE:
+                return _MODEL_CACHE[cache_key]
+            try:
+                with _normalized_windows_dll_directories():
+                    from funasr import AutoModel  # type: ignore[import-not-found]
+            except (ImportError, OSError) as exc:
+                raise ModelUnavailableError("FunASR 本地运行库不可用") from exc
+            try:
+                model = AutoModel(**options)
+            except Exception as exc:  # FunASR exposes several exception types.
+                raise ModelUnavailableError(f"无法加载本地模型 ({label}): {exc}") from exc
+            _MODEL_CACHE[cache_key] = model
+            return model
+
     try:
         return model_factory(**options)
     except Exception as exc:  # FunASR backends expose several exception types.
@@ -172,6 +242,7 @@ def _extract_ffmpeg_window(
     start_ms: int,
     end_ms: int,
     ffmpeg_path: Path,
+    cancel: object | None = None,
 ) -> None:
     duration_ms = end_ms - start_ms
     command = [
@@ -198,18 +269,28 @@ def _extract_ffmpeg_window(
         "-y",
         str(output),
     ]
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=False,
-        shell=False,
-        **hidden_subprocess_kwargs(),
-    )
-    if completed.returncode:
-        error = completed.stderr.decode("utf-8", "replace").strip()
-        raise ModelUnavailableError(f"FFmpeg 无法准备模型音频窗口: {error}")
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            shell=False,
+            **hidden_subprocess_kwargs(),
+        )
+        while process.poll() is None:
+            if _cancelled(cancel):
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise ModelUnavailableError("模型音频准备已取消")
+            time.sleep(0.05)
+        if process.returncode:
+            stderr_file.seek(0)
+            error = stderr_file.read().decode("utf-8", "replace").strip()
+            raise ModelUnavailableError(f"FFmpeg 无法准备模型音频窗口: {error}")
 
 
 @contextmanager
@@ -219,14 +300,44 @@ def local_audio_window(
     start_ms: int,
     end_ms: int,
     ffmpeg_path: str | Path | None = None,
+    cancel: object | None = None,
 ) -> Iterator[Path]:
     """Yield a temporary, local WAV containing exactly the requested window."""
 
     source = Path(audio_path).expanduser()
     if not source.is_file():
         raise ModelUnavailableError(f"音频文件不可用: {source}")
+    if (
+        isinstance(start_ms, bool)
+        or isinstance(end_ms, bool)
+        or not isinstance(start_ms, (int, float))
+        or not isinstance(end_ms, (int, float))
+        or not math.isfinite(float(start_ms))
+        or not math.isfinite(float(end_ms))
+        or float(start_ms) != int(start_ms)
+        or float(end_ms) != int(end_ms)
+    ):
+        raise ValueError("model audio window must use finite integer milliseconds")
+    start_ms = int(start_ms)
+    end_ms = int(end_ms)
     if start_ms < 0 or end_ms <= start_ms:
         raise ValueError("invalid model audio window")
+
+    if source.suffix.casefold() == ".wav" and start_ms == 0:
+        try:
+            with wave.open(str(source), "rb") as reader:
+                duration_ms = reader.getnframes() * 1000 / reader.getframerate()
+                model_ready = (
+                    reader.getcomptype() == "NONE"
+                    and reader.getnchannels() == 1
+                    and reader.getsampwidth() == 2
+                    and reader.getframerate() == 16_000
+                )
+            if end_ms + 1 >= duration_ms and (ffmpeg_path is None or model_ready):
+                yield source.resolve()
+                return
+        except (EOFError, OSError, wave.Error, ZeroDivisionError):
+            pass
 
     with tempfile.TemporaryDirectory(prefix="cutvideo-model-") as directory:
         output = Path(directory) / "window.wav"
@@ -234,7 +345,14 @@ def local_audio_window(
             ffmpeg = Path(ffmpeg_path).expanduser()
             if not ffmpeg.is_file():
                 raise ModelUnavailableError(f"本地 FFmpeg 不可用: {ffmpeg}")
-            _extract_ffmpeg_window(source, output, start_ms, end_ms, ffmpeg.resolve())
+            _extract_ffmpeg_window(
+                source,
+                output,
+                start_ms,
+                end_ms,
+                ffmpeg.resolve(),
+                cancel,
+            )
         else:
             _extract_wave_window(source, output, start_ms, end_ms)
         if not output.is_file() or output.stat().st_size <= 44:
@@ -247,5 +365,6 @@ __all__ = [
     "configure_offline_environment",
     "load_funasr_model",
     "local_audio_window",
+    "model_execution_guard",
     "require_local_model",
 ]

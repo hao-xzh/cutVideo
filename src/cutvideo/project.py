@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Any, Final
 from uuid import uuid4
 
+from . import __version__
+
 PROJECT_SCHEMA: Final = "cutvideo.project"
 PROJECT_VERSION: Final = 1
-DEFAULT_APP_VERSION: Final = "0.1.0"
+DEFAULT_APP_VERSION: Final = __version__
 _HASH_CHUNK_BYTES: Final = 1024 * 1024
 
 
@@ -294,6 +296,7 @@ class CutCandidate:
     suggested_end_sample: int
     confidence: float
     reasons: list[str] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     status: CandidateStatus = CandidateStatus.NEEDS_REVIEW
     review_required: bool = True
     final_start_sample: int | None = None
@@ -309,6 +312,7 @@ class CutCandidate:
                 raise ProjectValidationError(f"未知候选状态: {self.status!r}") from exc
         # Keep a private copy: callers often pass a tuple or a model-owned list.
         self.reasons = list(self.reasons)
+        self.diagnostics = dict(self.diagnostics)
 
     @classmethod
     def from_alignment(
@@ -355,6 +359,7 @@ class CutCandidate:
             suggested_end_sample=end,
             confidence=getattr(alignment, "confidence", None),
             reasons=list(getattr(alignment, "reasons", [])),
+            diagnostics=dict(getattr(alignment, "diagnostics", {})),
             status=status,
             review_required=requires_review,
         )
@@ -425,6 +430,7 @@ class CutCandidate:
         self.confidence = float(self.confidence)
         if not isinstance(self.reasons, list) or any(not isinstance(item, str) for item in self.reasons):
             raise ProjectValidationError(f"{label}.reasons 必须是字符串数组")
+        _diagnostic_mapping(self.diagnostics, f"{label}.diagnostics")
         if not isinstance(self.status, CandidateStatus):
             try:
                 self.status = CandidateStatus(_enum_value(self.status))
@@ -470,6 +476,7 @@ class CutCandidate:
             "source_end_char": self.source_end_char,
             "confidence": self.confidence,
             "reasons": list(self.reasons),
+            "diagnostics": dict(self.diagnostics),
             "status": self.status.value,
             "review_required": self.review_required,
         }
@@ -497,6 +504,7 @@ class CutCandidate:
             source_end_char=_optional_nullable_int_field(data, "source_end_char", label),
             confidence=_number_field(data, "confidence", label),
             reasons=_optional_string_list_field(data, "reasons", label),
+            diagnostics=dict(_diagnostic_mapping(data.get("diagnostics", {}), f"{label}.diagnostics")),
             status=_string_field(data, "status", label),
             review_required=_optional_bool_field(data, "review_required", label, True),
         )
@@ -511,6 +519,7 @@ class ProjectV1:
     audio_info: AudioInfo
     candidates: list[CutCandidate] = field(default_factory=list)
     models: list[ModelInfo] = field(default_factory=list)
+    analysis_diagnostics: dict[str, Any] = field(default_factory=dict)
     export_options: ExportOptions = field(
         default_factory=lambda: ExportOptions(output_directory=".")
     )
@@ -529,6 +538,7 @@ class ProjectV1:
         *,
         candidates: list[CutCandidate] | None = None,
         models: list[ModelInfo] | None = None,
+        analysis_diagnostics: Mapping[str, Any] | None = None,
         output_directory: str | Path | None = None,
         app_version: str = DEFAULT_APP_VERSION,
     ) -> ProjectV1:
@@ -541,6 +551,7 @@ class ProjectV1:
             audio_info=audio_info,
             candidates=list(candidates or []),
             models=list(models or []),
+            analysis_diagnostics=dict(analysis_diagnostics or {}),
             export_options=ExportOptions(output_directory=str(output.resolve())),
             app_version=app_version,
         )
@@ -607,6 +618,7 @@ class ProjectV1:
             if model.purpose in purposes:
                 raise ProjectValidationError(f"模型用途重复: {model.purpose}")
             purposes.add(model.purpose)
+        _diagnostic_mapping(self.analysis_diagnostics, "analysis_diagnostics")
         if not isinstance(self.candidates, list):
             raise ProjectValidationError("candidates 必须是数组")
         ids: set[str] = set()
@@ -647,6 +659,7 @@ class ProjectV1:
             },
             "audio_info": self.audio_info.to_dict(),
             "models": [model.to_dict() for model in self.models],
+            "analysis_diagnostics": dict(self.analysis_diagnostics),
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "export_options": self.export_options.to_dict(),
         }
@@ -671,6 +684,9 @@ class ProjectV1:
             ),
             audio_info=AudioInfo.from_dict(_required(data, "audio_info", "project")),
             models=[ModelInfo.from_dict(item, index) for index, item in enumerate(models_data)],
+            analysis_diagnostics=dict(
+                _diagnostic_mapping(data.get("analysis_diagnostics", {}), "analysis_diagnostics")
+            ),
             candidates=[
                 CutCandidate.from_dict(item, index)
                 for index, item in enumerate(candidates_data)
@@ -782,6 +798,34 @@ def _mapping(value: object, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ProjectValidationError(f"{label} 必须是 JSON 对象")
     return value
+
+
+def _diagnostic_mapping(value: object, label: str) -> Mapping[str, Any]:
+    data = _mapping(value, label)
+    _validate_diagnostic_value(data, label, depth=0)
+    return data
+
+
+def _validate_diagnostic_value(value: object, label: str, *, depth: int) -> None:
+    if depth > 8:
+        raise ProjectValidationError(f"{label} 嵌套过深")
+    if value is None or isinstance(value, (bool, str, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProjectValidationError(f"{label} 不能包含 NaN 或无穷大")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_diagnostic_value(item, f"{label}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProjectValidationError(f"{label} 的键必须是字符串")
+            _validate_diagnostic_value(item, f"{label}.{key}", depth=depth + 1)
+        return
+    raise ProjectValidationError(f"{label} 只能包含 JSON 基础类型")
 
 
 def _required(data: Mapping[str, Any], key: str, label: str) -> Any:

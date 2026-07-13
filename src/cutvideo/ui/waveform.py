@@ -18,6 +18,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from ..audio import WaveformEnvelope
+from .theme import theme_color
 
 
 class WaveformWidget(QWidget):
@@ -30,7 +31,7 @@ class WaveformWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("waveformWidget")
-        self.setMinimumHeight(190)
+        self.setMinimumHeight(140)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._envelope: WaveformEnvelope | None = None
@@ -189,6 +190,12 @@ class WaveformWidget(QWidget):
         )
 
     def _set_view_range(self, start_sample: int, end_sample: int) -> None:
+        # A selection boundary is calculated from the current pixel-to-sample
+        # mapping.  Changing that mapping before mouse release makes the same
+        # cursor position resolve to a different sample and produces visible
+        # jitter.  Panning remains an explicit Alt+drag operation.
+        if self._dragging in {"start", "end", "select"}:
+            return
         total = max(1, self._total_samples)
         requested_start = int(start_sample)
         requested_end = int(end_sample)
@@ -220,23 +227,13 @@ class WaveformWidget(QWidget):
             return math.inf
         return abs(x - self._sample_to_x(sample))
 
-    def _keep_dragged_sample_visible(self, sample: int) -> None:
-        span = self._view_end - self._view_start
-        margin = max(1, round(span * 0.06))
-        if sample < self._view_start + margin:
-            self.pan_samples(sample - (self._view_start + margin))
-        elif sample > self._view_end - margin:
-            self.pan_samples(sample - (self._view_end - margin))
-
     def paintEvent(self, _event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#f8fafc"))
-        painter.setPen(QPen(QColor("#dce2e9"), 1))
-        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 7, 7)
+        painter.fillRect(self.rect(), QColor(theme_color("waveform_bg")))
 
         if self._envelope is None or not self._envelope.points or self._total_samples <= 0:
-            painter.setPen(QColor("#7b8798"))
+            painter.setPen(QColor(theme_color("muted_low")))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
             return
 
@@ -244,8 +241,6 @@ class WaveformWidget(QWidget):
         bottom = float(self.height() - 24)
         middle = (top + bottom) / 2
         amplitude = max(1.0, (bottom - top) / 2)
-        painter.setPen(QPen(QColor("#e2e7ed"), 1))
-        painter.drawLine(QPointF(1, middle), QPointF(self.width() - 2, middle))
 
         envelope = self._envelope
         first = max(0, self._view_start // envelope.block_size)
@@ -270,7 +265,7 @@ class WaveformWidget(QWidget):
                 y_bottom = middle - minimum * amplitude
                 path.moveTo(x, y_top)
                 path.lineTo(x, y_bottom)
-            painter.setPen(QPen(QColor("#5276a8"), 1.15))
+            painter.setPen(QPen(QColor(theme_color("waveform")), 1.15))
             painter.drawPath(path)
 
         selection_left = self._sample_to_x(self._selection_start)
@@ -278,21 +273,23 @@ class WaveformWidget(QWidget):
         visible_left = max(1.0, selection_left)
         visible_right = min(float(self.width() - 2), selection_right)
         if visible_right > visible_left:
+            selection_color = QColor(theme_color("accent"))
+            selection_color.setAlpha(42)
             painter.fillRect(
                 int(visible_left),
                 int(top),
                 max(1, int(visible_right - visible_left)),
                 int(bottom - top),
-                QColor(224, 153, 66, 45),
+                selection_color,
             )
-        edge_pen = QPen(QColor("#c8782d"), 2)
+        edge_pen = QPen(QColor(theme_color("accent")), 2)
         painter.setPen(edge_pen)
         if self._view_start <= self._selection_start <= self._view_end:
             painter.drawLine(QPointF(selection_left, top), QPointF(selection_left, bottom))
         if self._view_start <= self._selection_end <= self._view_end:
             painter.drawLine(QPointF(selection_right, top), QPointF(selection_right, bottom))
 
-        painter.setPen(QColor("#697586"))
+        painter.setPen(QColor(theme_color("waveform_label")))
         left_seconds = self._view_start / envelope.sample_rate
         right_seconds = self._view_end / envelope.sample_rate
         painter.drawText(8, self.height() - 7, _format_seconds(left_seconds))
@@ -375,8 +372,6 @@ class WaveformWidget(QWidget):
                 self._total_samples,
                 max(self._selection_start + 1, sample),
             )
-        dragged_sample = self._selection_start if self._dragging == "start" else self._selection_end
-        self._keep_dragged_sample_visible(dragged_sample)
         self.boundariesChanged.emit(self._selection_start, self._selection_end)
         self.update()
         event.accept()

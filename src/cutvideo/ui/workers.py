@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import tempfile
 import threading
 from collections.abc import Callable
-from contextlib import suppress
-from dataclasses import dataclass
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
-import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 from ..alignment import (
     ALIGNMENT_PIPELINE_NAME,
     ALIGNMENT_PIPELINE_PURPOSE,
     ALIGNMENT_PIPELINE_VERSION,
+    BOUNDARY_EXPANDED,
+    BOUNDARY_REFINEMENT_UNCERTAIN,
     SHORT_HIGHLIGHT,
+    STATUS_NEEDS_REVIEW,
     AlignmentCandidate,
     FunASRAsrAligner,
     FunASRForceAligner,
@@ -26,13 +30,17 @@ from ..alignment import (
     normalize_with_mapping,
 )
 from ..audio import (
+    BOUNDARY_MAX_EXPAND_MS,
+    BOUNDARY_SEARCH_MS,
+    BOUNDARY_ZERO_CROSSING_MS,
     AudioInfo,
     CutInterval,
     WaveformEnvelope,
     decode_f32,
     probe_audio,
+    probe_audio_with_waveform,
     read_waveform_envelopes,
-    refine_boundary,
+    refine_cut_boundaries,
     write_cut_list_csv,
 )
 from ..docx_parser import ParsedTranscript, parse_docx
@@ -43,6 +51,7 @@ from ..ffmpeg import (
     export_audio,
     generate_preview,
 )
+from ..model_runtime import local_audio_window, model_execution_guard
 from ..project import (
     AudioInfo as ProjectAudioInfo,
 )
@@ -60,6 +69,7 @@ from ..resources import RuntimeResources, discover_resources, load_manifest
 
 ProgressReporter = Callable[[float, str], None]
 Operation = Callable[["CancelToken", ProgressReporter], object]
+FileStamp = tuple[int, int, int, int]
 
 
 class TaskCancelled(RuntimeError):
@@ -133,6 +143,9 @@ class PreflightResult:
     tools: FFmpegTools
     audio_source: SourceFile
     document_source: SourceFile
+    audio_stamp: FileStamp
+    document_stamp: FileStamp
+    waveform_envelope: WaveformEnvelope
     reused_project: ProjectV1 | None = None
     reused_project_path: Path | None = None
 
@@ -176,10 +189,35 @@ def _same_source(left: SourceFile, right: SourceFile) -> bool:
     return left.size_bytes == right.size_bytes and left.sha256 == right.sha256
 
 
-def _require_preflight_sources(preflight: PreflightResult, stage: str) -> None:
-    if not preflight.audio_source.matches_file(
-        preflight.audio_source.path
-    ) or not preflight.document_source.matches_file(preflight.document_source.path):
+def _file_stamp(path: str | Path) -> FileStamp:
+    stat = Path(path).expanduser().stat()
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, getattr(stat, "st_ino", 0))
+
+
+def _fingerprint_stable_source(path: str | Path) -> tuple[SourceFile, FileStamp]:
+    before = _file_stamp(path)
+    source = SourceFile.from_path(path)
+    after = _file_stamp(source.path)
+    if before != after:
+        raise ValueError("计算文件指纹时输入发生变化，请重试")
+    return source, after
+
+
+def _require_preflight_sources(
+    preflight: PreflightResult,
+    stage: str,
+    *,
+    verify_digest: bool = False,
+) -> None:
+    unchanged = (
+        _file_stamp(preflight.audio_source.path) == preflight.audio_stamp
+        and _file_stamp(preflight.document_source.path) == preflight.document_stamp
+    )
+    if unchanged and verify_digest:
+        unchanged = preflight.audio_source.matches_file(
+            preflight.audio_source.path
+        ) and preflight.document_source.matches_file(preflight.document_source.path)
+    if not unchanged:
         raise ValueError(f"{stage}输入文件发生变化，请重新预检")
 
 
@@ -213,8 +251,8 @@ def _uses_current_alignment_strategy(project: ProjectV1) -> bool:
 def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
     def operation(token: CancelToken, report: ProgressReporter) -> PreflightResult:
         report(0.01, "正在固定输入文件指纹…")
-        audio_source = SourceFile.from_path(audio_path)
-        document_source = SourceFile.from_path(document_path)
+        audio_source, audio_stamp = _fingerprint_stable_source(audio_path)
+        document_source, document_stamp = _fingerprint_stable_source(document_path)
         token.raise_if_cancelled()
         report(0.04, "正在读取 Word 标注…")
         transcript = parse_docx(document_path)
@@ -222,7 +260,7 @@ def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
         resources = discover_resources()
         tools = discover_ffmpeg(resource_root=resources.root)
         report(0.08, "正在解码音频并建立准确时间轴…")
-        info = probe_audio(
+        info, waveform_envelope = probe_audio_with_waveform(
             audio_path,
             tools=tools,
             progress_cb=lambda value: report(0.08 + value * 0.76, "正在解码音频并建立准确时间轴…"),
@@ -230,9 +268,7 @@ def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
         )
         transcript.validate_audio_duration(info.total_samples * 1000 // info.sample_rate)
         token.raise_if_cancelled()
-        if not audio_source.matches_file(audio_path) or not document_source.matches_file(
-            document_path
-        ):
+        if _file_stamp(audio_path) != audio_stamp or _file_stamp(document_path) != document_stamp:
             raise ValueError("预检过程中输入文件发生变化，请重新开始预检")
 
         reused: ProjectV1 | None = None
@@ -276,6 +312,9 @@ def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
             tools,
             audio_source,
             document_source,
+            audio_stamp,
+            document_stamp,
+            waveform_envelope,
             reused,
             reused_path,
         )
@@ -301,14 +340,14 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
         if resources.fa_model is not None:
             force_aligner = FunASRForceAligner(
                 resources.fa_model,
-                ffmpeg_path=preflight.tools.ffmpeg,
+                ffmpeg_path=None,
             )
             models.append(_manifest_model_info(resources, "forced_alignment", "fa-zh"))
         if resources.asr_model is not None and resources.vad_model is not None:
             asr_aligner = FunASRAsrAligner(
                 resources.asr_model,
                 resources.vad_model,
-                ffmpeg_path=preflight.tools.ffmpeg,
+                ffmpeg_path=None,
             )
             models.append(
                 _manifest_model_info(
@@ -320,18 +359,41 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
             models.append(
                 _manifest_model_info(resources, "voice_activity_detection", "fsmn-vad")
             )
-        report(0.10, "正在识别整段真实语音并匹配 Word 文字…")
-        alignments = align_transcript(
-            preflight.transcript,
-            preflight.audio_info,
-            force_aligner,
-            asr_aligner,
-            progress_cb=lambda done, total: report(
-                0.10 + 0.60 * (done / max(1, total)),
-                f"正在按真实语音定位段落 {done}/{total}…",
+        report(0.06, "正在准备可复用的模型音频缓存…")
+        duration_ms = max(
+            1,
+            math.ceil(
+                preflight.audio_info.total_samples
+                * 1000
+                / preflight.audio_info.sample_rate
             ),
-            cancel=token,
         )
+        has_model = force_aligner is not None or asr_aligner is not None
+        model_audio_context = (
+            local_audio_window(
+                preflight.audio_info.path,
+                start_ms=0,
+                end_ms=duration_ms,
+                ffmpeg_path=preflight.tools.ffmpeg,
+                cancel=token,
+            )
+            if has_model
+            else nullcontext(preflight.audio_info.path)
+        )
+        with model_execution_guard(token), model_audio_context as model_audio_path:
+            model_audio_info = replace(preflight.audio_info, path=Path(model_audio_path))
+            report(0.10, "正在识别整段真实语音并匹配 Word 文字…")
+            alignments = align_transcript(
+                preflight.transcript,
+                model_audio_info,
+                force_aligner,
+                asr_aligner,
+                progress_cb=lambda done, total: report(
+                    0.10 + 0.60 * (done / max(1, total)),
+                    f"正在按真实语音定位段落 {done}/{total}…",
+                ),
+                cancel=token,
+            )
         token.raise_if_cancelled()
 
         count = max(1, len(alignments))
@@ -365,7 +427,7 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
 
         token.raise_if_cancelled()
         report(0.91, "正在创建项目记录并计算文件指纹…")
-        _require_preflight_sources(preflight, "自动分析过程中")
+        _require_preflight_sources(preflight, "自动分析过程中", verify_digest=True)
         storage_info = ProjectAudioInfo(
             sample_rate=preflight.audio_info.sample_rate,
             channels=preflight.audio_info.channels,
@@ -379,6 +441,21 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
             audio_info=storage_info,
             candidates=project_candidates,
             models=models,
+            analysis_diagnostics={
+                "alignment_pipeline": {
+                    "name": ALIGNMENT_PIPELINE_NAME,
+                    "version": ALIGNMENT_PIPELINE_VERSION,
+                    "matching_strategy": "anchored_monotonic_dp",
+                    "timestamp_unit": "ms",
+                },
+                "skipped_highlights": preflight.transcript.skipped_highlights,
+                "candidate_count": len(project_candidates),
+                "auto_approved_count": sum(
+                    item.status is CandidateStatus.AUTO_APPROVED
+                    for item in project_candidates
+                ),
+                "review_required_count": sum(item.needs_review for item in project_candidates),
+            },
             export_options=ExportOptions(
                 output_directory=str(Path(preflight.audio_source.path).parent)
             ),
@@ -398,7 +475,14 @@ def _refine_alignment(
     tools: FFmpegTools,
     token: CancelToken,
 ) -> None:
-    radius = max(1, round(info.sample_rate * 0.060))
+    radius = max(
+        1,
+        round(
+            info.sample_rate
+            * (BOUNDARY_SEARCH_MS + BOUNDARY_MAX_EXPAND_MS + BOUNDARY_ZERO_CROSSING_MS)
+            / 1000
+        ),
+    )
     clip_start = max(0, alignment.proposed_start_sample - radius)
     clip_end = min(info.total_samples, alignment.proposed_end_sample + radius)
     if clip_end <= clip_start:
@@ -414,32 +498,50 @@ def _refine_alignment(
     token.raise_if_cancelled()
     if not samples.size:
         return
-    mono = np.mean(samples, axis=1, dtype=np.float32)
     local_start = alignment.proposed_start_sample - clip_start
     local_end = alignment.proposed_end_sample - clip_start
     if local_end - local_start < 3:
         return
-    refined_start_local = refine_boundary(
-        mono,
+    refinement = refine_cut_boundaries(
+        samples,
         local_start,
-        info.sample_rate,
-        search_ms=60.0,
-        lower_bound=local_start,
-        upper_bound=max(local_start + 1, local_end),
-    )
-    refined_end_local = refine_boundary(
-        mono,
         local_end,
         info.sample_rate,
-        search_ms=60.0,
-        lower_bound=min(refined_start_local + 1, len(mono) - 1),
-        upper_bound=min(len(mono), local_end + 1),
+        left_guard_sample=(
+            alignment.left_guard_sample - clip_start
+            if alignment.left_guard_sample is not None
+            else None
+        ),
+        right_guard_sample=(
+            alignment.right_guard_sample - clip_start
+            if alignment.right_guard_sample is not None
+            else None
+        ),
+        vad_start_sample=(
+            alignment.speech_start_sample - clip_start
+            if alignment.speech_start_sample is not None
+            else None
+        ),
+        vad_end_sample=(
+            alignment.speech_end_sample - clip_start
+            if alignment.speech_end_sample is not None
+            else None
+        ),
+        sample_offset=clip_start,
     )
-    refined_start = clip_start + refined_start_local
-    refined_end = clip_start + refined_end_local
+    refined_start = clip_start + refinement.start_sample
+    refined_end = clip_start + refinement.end_sample
     if 0 <= refined_start < refined_end <= info.total_samples:
         alignment.proposed_start_sample = refined_start
         alignment.proposed_end_sample = refined_end
+        alignment.diagnostics["boundary_refinement"] = refinement.diagnostics
+        if refinement.requires_review:
+            alignment.requires_review = True
+            alignment.status = STATUS_NEEDS_REVIEW
+            if BOUNDARY_REFINEMENT_UNCERTAIN not in alignment.reasons:
+                alignment.reasons.append(BOUNDARY_REFINEMENT_UNCERTAIN)
+        if refinement.expanded and BOUNDARY_EXPANDED not in alignment.reasons:
+            alignment.reasons.append(BOUNDARY_EXPANDED)
 
 
 def make_waveform_operation(info: AudioInfo, tools: FFmpegTools) -> Operation:
@@ -549,11 +651,14 @@ def make_preview_operation(
     info: AudioInfo,
     tools: FFmpegTools,
     candidate_id: str,
+    mode: str,
     output_directory: Path,
 ) -> Operation:
     candidates = [CutCandidate.from_dict(item, index) for index, item in enumerate(project.to_dict()["candidates"])]
 
     def operation(token: CancelToken, report: ProgressReporter) -> CandidatePreviewResult:
+        if mode not in {"original", "selection", "edited"}:
+            raise ValueError(f"未知试听模式: {mode}")
         selected = [
             CutInterval(
                 candidate.effective_start_sample,
@@ -581,46 +686,54 @@ def make_preview_operation(
         padding = info.sample_rate * 2
         window_start = max(0, current.effective_start_sample - padding)
         window_end = min(info.total_samples, current.effective_end_sample + padding)
-        original = output_directory / f"{candidate_id}-original.wav"
-        edited = output_directory / f"{candidate_id}-edited.wav"
-        report(0.05, "正在生成试听片段…")
-        full_result = generate_preview(
-            info.path,
-            selected,
-            original,
-            edited,
-            start_sample=window_start,
-            end_sample=window_end,
-            info=info,
-            tools=tools,
-            fade_ms=project.export_options.crossfade_ms,
-            cancel=token,
-        )
-        token.raise_if_cancelled()
+        state_key = hashlib.sha256(
+            repr(
+                (
+                    candidate_id,
+                    current.effective_start_sample,
+                    current.effective_end_sample,
+                    [(item.start_sample, item.end_sample) for item in selected],
+                    project.export_options.crossfade_ms,
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        original = output_directory / f"{candidate_id}-{state_key}-original.wav"
+        edited = output_directory / f"{candidate_id}-{state_key}-edited.wav"
         selection_padding = round(info.sample_rate * 0.120)
         selection_start = max(0, current.effective_start_sample - selection_padding)
         selection_end = min(info.total_samples, current.effective_end_sample + selection_padding)
-        selection = output_directory / f"{candidate_id}-selection.wav"
-        selection_copy = output_directory / f"{candidate_id}-selection-copy.wav"
-        report(0.72, "正在生成待删片段试听…")
-        selection_result = generate_preview(
-            info.path,
-            [],
-            selection,
-            selection_copy,
-            start_sample=selection_start,
-            end_sample=selection_end,
-            info=info,
-            tools=tools,
-            fade_ms=project.export_options.crossfade_ms,
-            cancel=token,
-        )
+        selection = output_directory / f"{candidate_id}-{state_key}-selection.wav"
+        selection_copy = output_directory / f"{candidate_id}-{state_key}-selection-copy.wav"
+        if mode in {"original", "edited"} and not (original.is_file() and edited.is_file()):
+            report(0.10, "正在生成前后对比试听…")
+            generate_preview(
+                info.path,
+                selected,
+                original,
+                edited,
+                start_sample=window_start,
+                end_sample=window_end,
+                info=info,
+                tools=tools,
+                fade_ms=project.export_options.crossfade_ms,
+                cancel=token,
+            )
+        elif mode == "selection" and not selection.is_file():
+            report(0.10, "正在生成待删范围试听…")
+            generate_preview(
+                info.path,
+                [],
+                selection,
+                selection_copy,
+                start_sample=selection_start,
+                end_sample=selection_end,
+                info=info,
+                tools=tools,
+                fade_ms=project.export_options.crossfade_ms,
+                cancel=token,
+            )
         report(1.0, "试听片段已生成")
-        return CandidatePreviewResult(
-            full_result.original_wav_path,
-            selection_result.original_wav_path,
-            full_result.edited_wav_path,
-        )
+        return CandidatePreviewResult(original, selection, edited)
 
     return operation
 
@@ -666,6 +779,8 @@ def make_export_operation(
             snapshot.audio.path
         ) or not snapshot.document.matches_file(snapshot.document.path):
             raise ValueError("核对过程中输入文件发生变化，请重新分析")
+        verified_audio_stamp = _file_stamp(snapshot.audio.path)
+        verified_document_stamp = _file_stamp(snapshot.document.path)
         token.raise_if_cancelled()
         output_directory.mkdir(parents=True, exist_ok=True)
         source = Path(snapshot.audio.path)
@@ -714,9 +829,10 @@ def make_export_operation(
             write_cut_list_csv(staged_csv, intervals, snapshot.audio_info.sample_rate)
             save_project(snapshot, staged_project)
             token.raise_if_cancelled()
-            if not snapshot.audio.matches_file(
-                snapshot.audio.path
-            ) or not snapshot.document.matches_file(snapshot.document.path):
+            if (
+                _file_stamp(snapshot.audio.path) != verified_audio_stamp
+                or _file_stamp(snapshot.document.path) != verified_document_stamp
+            ):
                 raise ValueError("导出过程中输入文件发生变化，未替换任何输出文件")
             _commit_artifacts(
                 (

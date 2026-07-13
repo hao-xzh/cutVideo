@@ -10,19 +10,30 @@ from .alignment import (
     ALIGNMENT_PIPELINE_NAME,
     ALIGNMENT_PIPELINE_PURPOSE,
     ALIGNMENT_PIPELINE_VERSION,
+    BOUNDARY_EXPANDED,
+    BOUNDARY_REFINEMENT_UNCERTAIN,
+    STATUS_NEEDS_REVIEW,
     AlignmentCandidate,
     FunASRAsrAligner,
     FunASRForceAligner,
     align_transcript,
 )
+from .audio import (
+    BOUNDARY_MAX_EXPAND_MS,
+    BOUNDARY_SEARCH_MS,
+    BOUNDARY_ZERO_CROSSING_MS,
+    decode_f32,
+    probe_audio,
+    refine_cut_boundaries,
+)
 from .audio import AudioInfo as DecodedAudioInfo
-from .audio import decode_f32, probe_audio, refine_boundary
 from .docx_parser import ParsedTranscript, parse_docx
 from .ffmpeg import FFmpegTools
 from .project import (
     AudioInfo as ProjectAudioInfo,
 )
 from .project import (
+    CandidateStatus,
     CutCandidate,
     ExportOptions,
     ModelInfo,
@@ -112,9 +123,16 @@ def _refine_candidate_boundaries(
     progress_cb: ProgressCallback | None,
     cancel: Event | Callable[[], bool] | None,
 ) -> None:
-    """Snap proposed cuts to quiet zero crossings without loading the whole file."""
+    """Refine cuts through speech edges, neighbor guards and real zero crossings."""
 
-    radius = max(1, round(audio_info.sample_rate * 0.065))
+    radius = max(
+        1,
+        round(
+            audio_info.sample_rate
+            * (BOUNDARY_SEARCH_MS + BOUNDARY_MAX_EXPAND_MS + BOUNDARY_ZERO_CROSSING_MS)
+            / 1000
+        ),
+    )
     total = len(candidates)
     for index, candidate in enumerate(candidates):
         if _cancelled(cancel):
@@ -134,28 +152,44 @@ def _refine_candidate_boundaries(
             local_end = candidate.proposed_end_sample - window_start
             if local_end - local_start < 3:
                 continue
-            refined_start = refine_boundary(
+            refinement = refine_cut_boundaries(
                 pcm,
                 local_start,
-                audio_info.sample_rate,
-                search_ms=60,
-                # Automatic acoustic snapping may only shrink the proposed
-                # deletion.  Expanding toward retained speech without a
-                # neighboring-token bound could silently remove a syllable.
-                lower_bound=local_start,
-                upper_bound=max(1, local_end),
-            )
-            refined_end = refine_boundary(
-                pcm,
                 local_end,
                 audio_info.sample_rate,
-                search_ms=60,
-                lower_bound=min(refined_start + 1, len(pcm) - 1),
-                upper_bound=min(len(pcm), local_end + 1),
+                left_guard_sample=(
+                    candidate.left_guard_sample - window_start
+                    if candidate.left_guard_sample is not None
+                    else None
+                ),
+                right_guard_sample=(
+                    candidate.right_guard_sample - window_start
+                    if candidate.right_guard_sample is not None
+                    else None
+                ),
+                vad_start_sample=(
+                    candidate.speech_start_sample - window_start
+                    if candidate.speech_start_sample is not None
+                    else None
+                ),
+                vad_end_sample=(
+                    candidate.speech_end_sample - window_start
+                    if candidate.speech_end_sample is not None
+                    else None
+                ),
+                sample_offset=window_start,
             )
-            if refined_end > refined_start:
-                candidate.proposed_start_sample = window_start + refined_start
-                candidate.proposed_end_sample = window_start + refined_end
+            if refinement.end_sample > refinement.start_sample:
+                candidate.proposed_start_sample = window_start + refinement.start_sample
+                candidate.proposed_end_sample = window_start + refinement.end_sample
+                candidate.diagnostics["boundary_refinement"] = refinement.diagnostics
+                if refinement.requires_review:
+                    candidate.requires_review = True
+                    candidate.status = STATUS_NEEDS_REVIEW
+                    if BOUNDARY_REFINEMENT_UNCERTAIN not in candidate.reasons:
+                        candidate.reasons.append(BOUNDARY_REFINEMENT_UNCERTAIN)
+                if refinement.expanded and BOUNDARY_EXPANDED not in candidate.reasons:
+                    candidate.reasons.append(BOUNDARY_EXPANDED)
         _report(
             progress_cb,
             0.94 + (index + 1) / max(1, total) * 0.04,
@@ -286,6 +320,21 @@ def analyze_pair(
         audio_info=project_audio,
         candidates=candidates,
         models=models,
+        analysis_diagnostics={
+            "alignment_pipeline": {
+                "name": ALIGNMENT_PIPELINE_NAME,
+                "version": ALIGNMENT_PIPELINE_VERSION,
+                "matching_strategy": "anchored_monotonic_dp",
+                "timestamp_unit": "ms",
+            },
+            "skipped_highlights": parsed.skipped_highlights,
+            "warnings": list(warnings),
+            "candidate_count": len(candidates),
+            "auto_approved_count": sum(
+                item.status is CandidateStatus.AUTO_APPROVED for item in candidates
+            ),
+            "review_required_count": sum(item.needs_review for item in candidates),
+        },
         export_options=ExportOptions(
             output_directory=str(Path(audio_source.path).parent)
         ),

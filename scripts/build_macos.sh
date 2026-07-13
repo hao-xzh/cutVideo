@@ -6,7 +6,8 @@ cd "$ROOT"
 PYTHON="${PYTHON:-.venv/bin/python}"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 if [[ "$("$PYTHON" -c 'import platform, sys; print(sys.version_info[:2] == (3, 11) and sys.version_info.releaselevel == "final" and platform.machine() == "arm64")')" != "True" ]]; then
   echo "macOS release builds require a final native arm64 Python 3.11 runtime." >&2
   exit 1
@@ -51,7 +52,14 @@ fi
   src/cutvideo_launcher.py
 
 APP="dist/CutVideo.app"
+APP_VERSION="$(PYTHONPATH="$ROOT/src" "$PYTHON" -c 'from cutvideo import __version__; print(__version__)')"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$APP/Contents/Info.plist" \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MACOSX_DEPLOYMENT_TARGET" "$APP/Contents/Info.plist" \
+  || /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MACOSX_DEPLOYMENT_TARGET" "$APP/Contents/Info.plist"
 file "$APP/Contents/MacOS/CutVideo" | grep -q "arm64"
+"$PYTHON" scripts/audit_macos_bundle.py "$APP" --maximum-minos "$MACOSX_DEPLOYMENT_TARGET"
 if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --deep --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP"
 else

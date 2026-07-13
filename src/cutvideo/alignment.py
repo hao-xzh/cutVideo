@@ -8,11 +8,12 @@ test doubles without introducing a storage-layer dependency.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
+from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -22,6 +23,7 @@ from .model_runtime import (
     ModelUnavailableError,
     load_funasr_model,
     local_audio_window,
+    model_execution_guard,
     require_local_model,
 )
 
@@ -35,12 +37,20 @@ ASR_ALIGNER_UNAVAILABLE = "asr_aligner_unavailable"
 DOCUMENT_TIME_FALLBACK = "document_time_search_fallback"
 FORCE_CONTEXT_UNSTABLE = "local_context_alignment_unstable"
 LOCAL_RECOGNITION_UNAVAILABLE = "local_audio_recognition_refinement_unavailable"
+ALIGNMENT_AMBIGUOUS = "alignment_candidate_margin_too_small"
+COARSE_TIMESTAMP = "coarse_timestamp_not_character_level"
+TIMESTAMP_ANOMALY = "timestamp_validation_failed"
+MODEL_CONFIDENCE_UNAVAILABLE = "model_character_confidence_unavailable"
+LOW_MODEL_CONFIDENCE = "low_model_character_confidence"
+BOUNDARY_GUARD_UNAVAILABLE = "adjacent_character_guard_unavailable"
+BOUNDARY_EXPANDED = "boundary_expanded_for_speech_edge"
+BOUNDARY_REFINEMENT_UNCERTAIN = "boundary_refinement_evidence_incomplete"
 
 # Stored in every project so results produced by an older alignment strategy
 # are never silently reused after the audio-first pipeline changes.
 ALIGNMENT_PIPELINE_PURPOSE = "alignment_strategy"
 ALIGNMENT_PIPELINE_NAME = "audio-text-primary"
-ALIGNMENT_PIPELINE_VERSION = "5"
+ALIGNMENT_PIPELINE_VERSION = "6"
 
 # A highlighted phrase should be one locally continuous piece of speech.  A
 # larger hole usually means that sparse ASR matches from two different spoken
@@ -50,6 +60,22 @@ MAX_HIGHLIGHT_INTERNAL_GAP_MS = 1_500.0
 
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_AUTO_APPROVED = "auto_approved"
+
+TIMESTAMP_PRECISION_CHARACTER = "character"
+TIMESTAMP_PRECISION_TOKEN = "token"
+TIMESTAMP_PRECISION_SEGMENT = "segment"
+TIMESTAMP_PRECISION_UNKNOWN = "unknown"
+_PRECISION_RANK = {
+    TIMESTAMP_PRECISION_CHARACTER: 0,
+    TIMESTAMP_PRECISION_TOKEN: 1,
+    TIMESTAMP_PRECISION_SEGMENT: 2,
+    TIMESTAMP_PRECISION_UNKNOWN: 3,
+}
+_TIMESTAMP_EPSILON_MS = 5.0
+_MIN_TIMESTAMP_SPAN_MS = 5.0
+_VAD_GAP_MS = 500.0
+_MIN_ALIGNMENT_MARGIN = 0.12
+_LOW_MODEL_CONFIDENCE_THRESHOLD = 0.50
 
 
 class AlignmentCancelledError(RuntimeError):
@@ -155,65 +181,442 @@ def _phonetic_keys(text: str) -> tuple[str, ...]:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _DpEntry:
+    score: float
+    previous_i: int
+    previous_j: int
+    previous_rank: int
+    operation: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkAlignment:
+    best_pairs: tuple[tuple[int, int, float], ...]
+    second_pairs: tuple[tuple[int, int, float], ...]
+    best_score: float
+    second_score: float | None
+    forced_partition: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CharacterAlignment:
+    pairs: tuple[tuple[int, int, float], ...]
+    margins: Mapping[int, float]
+    ambiguity_margin: float
+    forced_partition: bool
+
+
+def _character_match(
+    reference_character: str,
+    observed_character: str,
+    reference_key: str,
+    observed_key: str,
+    *,
+    allow_phonetic_fallback: bool,
+) -> tuple[float, float]:
+    if reference_character == observed_character:
+        return 2.0, 1.0
+    if (
+        allow_phonetic_fallback
+        and _is_han_character(reference_character)
+        and _is_han_character(observed_character)
+        and reference_key == observed_key
+    ):
+        return 1.35, 0.88
+    return -1.15, 0.0
+
+
+def _reference_segment_indexes(transcript: str, normalized: NormalizedText) -> tuple[int, ...]:
+    segment_at_original: list[int] = []
+    segment = 0
+    for character in transcript:
+        segment_at_original.append(segment)
+        if character in {"\n", "\r"}:
+            segment += 1
+    return tuple(
+        segment_at_original[index] if index < len(segment_at_original) else segment
+        for index in normalized.normalized_to_original
+    )
+
+
+def _unique_monotonic_anchors(
+    reference_text: str,
+    observed_text: str,
+    *,
+    width: int = 4,
+) -> list[tuple[int, int, int]]:
+    if min(len(reference_text), len(observed_text)) < width:
+        return []
+    reference_positions: dict[str, list[int]] = {}
+    observed_positions: dict[str, list[int]] = {}
+    for index in range(len(reference_text) - width + 1):
+        reference_positions.setdefault(reference_text[index : index + width], []).append(index)
+    for index in range(len(observed_text) - width + 1):
+        observed_positions.setdefault(observed_text[index : index + width], []).append(index)
+    candidates = sorted(
+        (positions[0], observed_positions[key][0], width)
+        for key, positions in reference_positions.items()
+        if len(positions) == 1 and len(observed_positions.get(key, ())) == 1
+    )
+    if not candidates:
+        return []
+
+    tails: list[int] = []
+    tail_candidates: list[int] = []
+    previous = [-1] * len(candidates)
+    for candidate_index, (_reference, observed, _width) in enumerate(candidates):
+        position = bisect_left(tails, observed)
+        if position == len(tails):
+            tails.append(observed)
+            tail_candidates.append(candidate_index)
+        else:
+            tails[position] = observed
+            tail_candidates[position] = candidate_index
+        if position:
+            previous[candidate_index] = tail_candidates[position - 1]
+
+    selected: list[tuple[int, int, int]] = []
+    candidate_index = tail_candidates[-1]
+    while candidate_index >= 0:
+        selected.append(candidates[candidate_index])
+        candidate_index = previous[candidate_index]
+    selected.reverse()
+
+    non_overlapping: list[tuple[int, int, int]] = []
+    reference_end = observed_end = 0
+    for reference, observed, anchor_width in selected:
+        if reference < reference_end or observed < observed_end:
+            continue
+        non_overlapping.append((reference, observed, anchor_width))
+        reference_end = reference + anchor_width
+        observed_end = observed + anchor_width
+    return non_overlapping
+
+
+def _trace_dp_path(
+    cells: Mapping[tuple[int, int], tuple[_DpEntry, ...]],
+    end_i: int,
+    end_j: int,
+    rank: int,
+    reference_text: str,
+    observed_text: str,
+    reference_keys: Sequence[str],
+    observed_keys: Sequence[str],
+    *,
+    reference_offset: int,
+    observed_offset: int,
+    allow_phonetic_fallback: bool,
+) -> tuple[tuple[int, int, float], ...]:
+    pairs: list[tuple[int, int, float]] = []
+    i, j = end_i, end_j
+    while i or j:
+        entries = cells.get((i, j), ())
+        if rank >= len(entries):
+            break
+        entry = entries[rank]
+        if entry.operation == "match":
+            _score, confidence = _character_match(
+                reference_text[i - 1],
+                observed_text[j - 1],
+                reference_keys[i - 1],
+                observed_keys[j - 1],
+                allow_phonetic_fallback=allow_phonetic_fallback,
+            )
+            if confidence > 0:
+                pairs.append(
+                    (reference_offset + i - 1, observed_offset + j - 1, confidence)
+                )
+        i, j, rank = entry.previous_i, entry.previous_j, entry.previous_rank
+    pairs.reverse()
+    return tuple(pairs)
+
+
+def _dp_align_chunk(
+    reference_text: str,
+    observed_text: str,
+    *,
+    reference_offset: int,
+    observed_offset: int,
+    allow_phonetic_fallback: bool,
+    reference_segments: Sequence[int],
+    observed_segments: Sequence[int],
+) -> _ChunkAlignment:
+    reference_length = len(reference_text)
+    observed_length = len(observed_text)
+    if not reference_length:
+        return _ChunkAlignment((), (), -0.55 * observed_length, None)
+    if not observed_length:
+        return _ChunkAlignment((), (), -0.75 * reference_length, None)
+
+    band = max(32, abs(reference_length - observed_length) + 24)
+    estimated_cells = (reference_length + 1) * min(observed_length + 1, 2 * band + 3)
+    if estimated_cells > 280_000 and reference_length > 1 and observed_length > 1:
+        reference_midpoint = reference_length // 2
+        observed_midpoint = max(
+            1,
+            min(
+                observed_length - 1,
+                round(observed_length * reference_midpoint / reference_length),
+            ),
+        )
+        left = _dp_align_chunk(
+            reference_text[:reference_midpoint],
+            observed_text[:observed_midpoint],
+            reference_offset=reference_offset,
+            observed_offset=observed_offset,
+            allow_phonetic_fallback=allow_phonetic_fallback,
+            reference_segments=reference_segments[:reference_midpoint],
+            observed_segments=observed_segments[:observed_midpoint],
+        )
+        right = _dp_align_chunk(
+            reference_text[reference_midpoint:],
+            observed_text[observed_midpoint:],
+            reference_offset=reference_offset + reference_midpoint,
+            observed_offset=observed_offset + observed_midpoint,
+            allow_phonetic_fallback=allow_phonetic_fallback,
+            reference_segments=reference_segments[reference_midpoint:],
+            observed_segments=observed_segments[observed_midpoint:],
+        )
+        best_pairs = left.best_pairs + right.best_pairs
+        alternatives: list[tuple[float, tuple[tuple[int, int, float], ...]]] = []
+        if left.second_score is not None:
+            alternatives.append(
+                (left.second_score + right.best_score, left.second_pairs + right.best_pairs)
+            )
+        if right.second_score is not None:
+            alternatives.append(
+                (left.best_score + right.second_score, left.best_pairs + right.second_pairs)
+            )
+        alternatives.sort(key=lambda item: item[0], reverse=True)
+        return _ChunkAlignment(
+            best_pairs,
+            alternatives[0][1] if alternatives else (),
+            left.best_score + right.best_score,
+            alternatives[0][0] if alternatives else None,
+            True,
+        )
+
+    reference_keys = (
+        _phonetic_keys(reference_text)
+        if allow_phonetic_fallback
+        else tuple(f"literal:{character}" for character in reference_text)
+    )
+    observed_keys = (
+        _phonetic_keys(observed_text)
+        if allow_phonetic_fallback
+        else tuple(f"literal:{character}" for character in observed_text)
+    )
+    reference_segment_count = max(reference_segments, default=0) + 1
+    observed_segment_count = max(observed_segments, default=0) + 1
+    cells: dict[tuple[int, int], tuple[_DpEntry, ...]] = {
+        (0, 0): (_DpEntry(0.0, 0, 0, 0, ""),)
+    }
+    for i in range(reference_length + 1):
+        center = round(i * observed_length / reference_length)
+        minimum_j = max(0, center - band)
+        maximum_j = min(observed_length, center + band)
+        if i == 0:
+            minimum_j = 0
+        if i == reference_length:
+            maximum_j = observed_length
+        for j in range(minimum_j, maximum_j + 1):
+            if i == 0 and j == 0:
+                continue
+            possibilities: list[_DpEntry] = []
+            if i and j:
+                score, _confidence = _character_match(
+                    reference_text[i - 1],
+                    observed_text[j - 1],
+                    reference_keys[i - 1],
+                    observed_keys[j - 1],
+                    allow_phonetic_fallback=allow_phonetic_fallback,
+                )
+                if reference_segment_count > 1 and observed_segment_count > 1:
+                    reference_position = reference_segments[i - 1] / (reference_segment_count - 1)
+                    observed_position = observed_segments[j - 1] / (observed_segment_count - 1)
+                    score -= 0.20 * abs(reference_position - observed_position)
+                for rank, previous in enumerate(cells.get((i - 1, j - 1), ())):
+                    possibilities.append(
+                        _DpEntry(previous.score + score, i - 1, j - 1, rank, "match")
+                    )
+            if i:
+                for rank, previous in enumerate(cells.get((i - 1, j), ())):
+                    possibilities.append(
+                        _DpEntry(previous.score - 0.75, i - 1, j, rank, "delete")
+                    )
+            if j:
+                for rank, previous in enumerate(cells.get((i, j - 1), ())):
+                    possibilities.append(
+                        _DpEntry(previous.score - 0.55, i, j - 1, rank, "insert")
+                    )
+            possibilities.sort(key=lambda entry: entry.score, reverse=True)
+            selected: list[_DpEntry] = []
+            seen: set[tuple[int, int, int, str]] = set()
+            for entry in possibilities:
+                identity = (
+                    entry.previous_i,
+                    entry.previous_j,
+                    entry.previous_rank,
+                    entry.operation,
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                selected.append(entry)
+                if len(selected) == 2:
+                    break
+            if selected:
+                cells[(i, j)] = tuple(selected)
+
+    terminal = cells.get((reference_length, observed_length), ())
+    if not terminal:
+        return _ChunkAlignment((), (), float("-inf"), None, True)
+    best_pairs = _trace_dp_path(
+        cells,
+        reference_length,
+        observed_length,
+        0,
+        reference_text,
+        observed_text,
+        reference_keys,
+        observed_keys,
+        reference_offset=reference_offset,
+        observed_offset=observed_offset,
+        allow_phonetic_fallback=allow_phonetic_fallback,
+    )
+    second_pairs = (
+        _trace_dp_path(
+            cells,
+            reference_length,
+            observed_length,
+            1,
+            reference_text,
+            observed_text,
+            reference_keys,
+            observed_keys,
+            reference_offset=reference_offset,
+            observed_offset=observed_offset,
+            allow_phonetic_fallback=allow_phonetic_fallback,
+        )
+        if len(terminal) > 1
+        else ()
+    )
+    return _ChunkAlignment(
+        best_pairs,
+        second_pairs,
+        terminal[0].score,
+        terminal[1].score if len(terminal) > 1 else None,
+    )
+
+
+def _monotonic_character_alignment(
+    reference_text: str,
+    observed_text: str,
+    *,
+    allow_phonetic_fallback: bool,
+    reference_segments: Sequence[int] | None = None,
+    observed_segments: Sequence[int] | None = None,
+) -> _CharacterAlignment:
+    if not reference_text or not observed_text:
+        return _CharacterAlignment((), {}, 0.0, False)
+    ref_segments = tuple(reference_segments or (0,) * len(reference_text))
+    obs_segments = tuple(observed_segments or (0,) * len(observed_text))
+    anchors = _unique_monotonic_anchors(reference_text, observed_text)
+    chunks: list[_ChunkAlignment] = []
+    anchor_pairs: list[tuple[int, int, float]] = []
+    reference_cursor = observed_cursor = 0
+    for reference_anchor, observed_anchor, width in anchors:
+        chunks.append(
+            _dp_align_chunk(
+                reference_text[reference_cursor:reference_anchor],
+                observed_text[observed_cursor:observed_anchor],
+                reference_offset=reference_cursor,
+                observed_offset=observed_cursor,
+                allow_phonetic_fallback=allow_phonetic_fallback,
+                reference_segments=ref_segments[reference_cursor:reference_anchor],
+                observed_segments=obs_segments[observed_cursor:observed_anchor],
+            )
+        )
+        anchor_pairs.extend(
+            (reference_anchor + offset, observed_anchor + offset, 1.0)
+            for offset in range(width)
+        )
+        reference_cursor = reference_anchor + width
+        observed_cursor = observed_anchor + width
+    chunks.append(
+        _dp_align_chunk(
+            reference_text[reference_cursor:],
+            observed_text[observed_cursor:],
+            reference_offset=reference_cursor,
+            observed_offset=observed_cursor,
+            allow_phonetic_fallback=allow_phonetic_fallback,
+            reference_segments=ref_segments[reference_cursor:],
+            observed_segments=obs_segments[observed_cursor:],
+        )
+    )
+
+    best_pairs = list(anchor_pairs)
+    for chunk in chunks:
+        best_pairs.extend(chunk.best_pairs)
+    best_pairs.sort(key=lambda match: (match[0], match[1]))
+
+    ambiguous_chunk: _ChunkAlignment | None = None
+    ambiguity_margin = 1.0
+    for chunk in chunks:
+        if chunk.second_score is None or not chunk.second_pairs:
+            continue
+        best_map = {reference: observed for reference, observed, _score in chunk.best_pairs}
+        second_map = {
+            reference: observed for reference, observed, _score in chunk.second_pairs
+        }
+        if best_map == second_map:
+            # Two paths that only reorder equivalent insert/delete operations
+            # do not represent a competing spoken occurrence.
+            continue
+        raw_margin = max(0.0, chunk.best_score - chunk.second_score)
+        normalized_margin = min(1.0, raw_margin / max(1.0, 2.0 * len(chunk.best_pairs)))
+        if normalized_margin < ambiguity_margin:
+            ambiguity_margin = normalized_margin
+            ambiguous_chunk = chunk
+
+    margins: dict[int, float] = {}
+    if ambiguous_chunk is not None:
+        best_map = {reference: observed for reference, observed, _score in ambiguous_chunk.best_pairs}
+        second_map = {
+            reference: observed for reference, observed, _score in ambiguous_chunk.second_pairs
+        }
+        for reference in set(best_map) | set(second_map):
+            if best_map.get(reference) != second_map.get(reference):
+                margins[reference] = ambiguity_margin
+    return _CharacterAlignment(
+        tuple(best_pairs),
+        margins,
+        ambiguity_margin if margins else 1.0,
+        any(chunk.forced_partition for chunk in chunks),
+    )
+
+
 def _matching_character_pairs(
     reference_text: str,
     observed_text: str,
     *,
     allow_phonetic_fallback: bool,
 ) -> list[tuple[int, int, float]]:
-    """Map observed characters monotonically, preferring exact text anchors.
+    """Map text with anchored, monotonic dynamic programming.
 
-    Chinese homophones are considered only inside gaps left by exact matching
-    blocks.  This prevents a phonetic match from displacing already reliable
-    literal context or making Latin/non-Han text fuzzy.
+    Unique exact 4-character anchors partition long recordings.  Gaps use a
+    weighted monotonic DP that explicitly models ASR insertions, omissions and
+    Chinese homophones instead of relying on a full-text heuristic matcher.
     """
 
-    exact_matcher = SequenceMatcher(None, reference_text, observed_text, autojunk=False)
-    matches: list[tuple[int, int, float]] = []
-    reference_keys = _phonetic_keys(reference_text) if allow_phonetic_fallback else ()
-    observed_keys = _phonetic_keys(observed_text) if allow_phonetic_fallback else ()
-    previous_reference_end = 0
-    previous_observed_end = 0
-
-    for reference_start, observed_start, size in exact_matcher.get_matching_blocks():
-        if (
-            allow_phonetic_fallback
-            and reference_start > previous_reference_end
-            and observed_start > previous_observed_end
-        ):
-            phonetic_matcher = SequenceMatcher(
-                None,
-                reference_keys[previous_reference_end:reference_start],
-                observed_keys[previous_observed_end:observed_start],
-                autojunk=False,
-            )
-            for local_reference, local_observed, phonetic_size in (
-                phonetic_matcher.get_matching_blocks()
-            ):
-                for offset in range(phonetic_size):
-                    reference_index = previous_reference_end + local_reference + offset
-                    observed_index = previous_observed_end + local_observed + offset
-                    reference_character = reference_text[reference_index]
-                    observed_character = observed_text[observed_index]
-                    if reference_character == observed_character:
-                        confidence = 1.0
-                    elif _is_han_character(reference_character) and _is_han_character(
-                        observed_character
-                    ):
-                        confidence = 0.9
-                    else:
-                        # Identical phonetic keys for non-Han text are literal
-                        # keys and should therefore only match equal characters.
-                        continue
-                    matches.append((reference_index, observed_index, confidence))
-
-        for offset in range(size):
-            matches.append((reference_start + offset, observed_start + offset, 1.0))
-        previous_reference_end = reference_start + size
-        previous_observed_end = observed_start + size
-
-    matches.sort(key=lambda match: (match[0], match[1]))
-    return matches
+    return list(
+        _monotonic_character_alignment(
+            reference_text,
+            observed_text,
+            allow_phonetic_fallback=allow_phonetic_fallback,
+        ).pairs
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,12 +628,31 @@ class TimedSpan:
     start_ms: float
     end_ms: float
     confidence: float = 1.0
+    model_confidence: float | None = None
+    timestamp_precision: str = TIMESTAMP_PRECISION_CHARACTER
+    alignment_margin: float = 1.0
 
     def __post_init__(self) -> None:
         if self.normalized_start < 0 or self.normalized_end <= self.normalized_start:
             raise ValueError("invalid normalized span")
-        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+        if (
+            not math.isfinite(self.start_ms)
+            or not math.isfinite(self.end_ms)
+            or self.start_ms < 0
+            or self.end_ms <= self.start_ms
+        ):
             raise ValueError("invalid timed span")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("timed span confidence must be between zero and one")
+        if self.model_confidence is not None and (
+            not math.isfinite(self.model_confidence)
+            or not 0.0 <= self.model_confidence <= 1.0
+        ):
+            raise ValueError("model confidence must be between zero and one")
+        if self.timestamp_precision not in _PRECISION_RANK:
+            raise ValueError("invalid timestamp precision")
+        if not math.isfinite(self.alignment_margin) or not 0.0 <= self.alignment_margin <= 1.0:
+            raise ValueError("alignment margin must be between zero and one")
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,10 +662,85 @@ class AlignmentTrack:
     spans: tuple[TimedSpan, ...]
     engine: str
     coverage: float
+    mean_model_confidence: float | None = None
+    minimum_model_confidence: float | None = None
+    low_confidence_ratio: float | None = None
+    timestamp_precision: str = TIMESTAMP_PRECISION_UNKNOWN
+    timestamp_valid: bool = True
+    ambiguity_margin: float = 1.0
+    diagnostics: tuple[str, ...] = ()
+    vad_ranges: tuple[tuple[float, float], ...] = ()
+    model_confidence_coverage: float = 0.0
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.coverage <= 1.0:
+        if not math.isfinite(self.coverage) or not 0.0 <= self.coverage <= 1.0:
             raise ValueError("coverage must be between zero and one")
+        for value in (
+            self.mean_model_confidence,
+            self.minimum_model_confidence,
+            self.low_confidence_ratio,
+            self.model_confidence_coverage,
+        ):
+            if value is not None and (not math.isfinite(value) or not 0.0 <= value <= 1.0):
+                raise ValueError("track confidence metrics must be between zero and one")
+        if self.timestamp_precision not in _PRECISION_RANK:
+            raise ValueError("invalid track timestamp precision")
+        if not isinstance(self.timestamp_valid, bool):
+            raise ValueError("track timestamp validity must be boolean")
+        if not isinstance(self.diagnostics, tuple) or any(
+            not isinstance(item, str) for item in self.diagnostics
+        ):
+            raise ValueError("track diagnostics must be a tuple of strings")
+        if not math.isfinite(self.ambiguity_margin) or not 0 <= self.ambiguity_margin <= 1:
+            raise ValueError("track ambiguity margin must be between zero and one")
+        previous_start = previous_end = -1.0
+        previous_normalized = -1
+        for span in self.spans:
+            if span.normalized_start < previous_normalized:
+                raise ValueError("alignment spans must be text-monotonic")
+            if (
+                span.start_ms + _TIMESTAMP_EPSILON_MS < previous_start
+                or span.end_ms + _TIMESTAMP_EPSILON_MS < previous_end
+            ):
+                raise ValueError("alignment spans must be time-monotonic")
+            previous_normalized = span.normalized_start
+            previous_start = max(previous_start, span.start_ms)
+            previous_end = max(previous_end, span.end_ms)
+        previous_vad_start = previous_vad_end = -1.0
+        for start_ms, end_ms in self.vad_ranges:
+            if (
+                not math.isfinite(start_ms)
+                or not math.isfinite(end_ms)
+                or start_ms < 0
+                or end_ms <= start_ms
+            ):
+                raise ValueError("invalid VAD range")
+            if (
+                start_ms + _TIMESTAMP_EPSILON_MS < previous_vad_start
+                or end_ms + _TIMESTAMP_EPSILON_MS < previous_vad_end
+            ):
+                raise ValueError("VAD ranges must be time-monotonic")
+            previous_vad_start = max(previous_vad_start, start_ms)
+            previous_vad_end = max(previous_vad_end, end_ms)
+
+
+@dataclass(frozen=True, slots=True)
+class AlignmentRange:
+    start_ms: float
+    end_ms: float
+    coverage: float
+    mean_model_confidence: float | None
+    minimum_model_confidence: float | None
+    low_confidence_ratio: float | None
+    timestamp_precision: str
+    ambiguity_margin: float
+    timestamp_valid: bool
+    model_confidence_coverage: float
+    vad_start_ms: float | None = None
+    vad_end_ms: float | None = None
+
+    def __getitem__(self, index: int | slice) -> object:
+        return (self.start_ms, self.end_ms, self.coverage)[index]
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,14 +751,25 @@ class RecognizedToken:
     start_ms: float
     end_ms: float
     confidence: float = 1.0
+    confidence_available: bool = False
+    timestamp_precision: str = TIMESTAMP_PRECISION_UNKNOWN
 
     def __post_init__(self) -> None:
         if not self.text:
             raise ValueError("recognized token text must not be empty")
-        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+        if (
+            not math.isfinite(self.start_ms)
+            or not math.isfinite(self.end_ms)
+            or self.start_ms < 0
+            or self.end_ms <= self.start_ms
+        ):
             raise ValueError("invalid recognized token interval")
-        if not 0.0 <= self.confidence <= 1.0:
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
             raise ValueError("recognized token confidence must be between zero and one")
+        if not isinstance(self.confidence_available, bool):
+            raise ValueError("recognized token confidence availability must be boolean")
+        if self.timestamp_precision not in _PRECISION_RANK:
+            raise ValueError("invalid recognized token timestamp precision")
 
 
 @runtime_checkable
@@ -305,6 +813,11 @@ class AlignmentCandidate:
     reasons: list[str] = field(default_factory=list)
     requires_review: bool = True
     status: str = STATUS_NEEDS_REVIEW
+    diagnostics: dict[str, object] = field(default_factory=dict)
+    left_guard_sample: int | None = None
+    right_guard_sample: int | None = None
+    speech_start_sample: int | None = None
+    speech_end_sample: int | None = None
 
     # Project/UI code historically uses "suggested" and "text".  Keeping
     # aliases here avoids duplicating an otherwise identical transport type.
@@ -332,22 +845,104 @@ def _get(value: object, *names: str, default: Any = _MISSING) -> Any:
     raise AttributeError(f"missing required field: {'/'.join(names)}")
 
 
-def _partition_token(token: str, start_ms: float, end_ms: float) -> list[tuple[str, float, float]]:
+@dataclass(frozen=True, slots=True)
+class _ObservedCharacter:
+    text: str
+    start_ms: float
+    end_ms: float
+    model_confidence: float | None
+    timestamp_precision: str
+    segment_index: int
+
+
+def _probability(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and 0.0 <= number <= 1.0 else None
+
+
+def _token_text(value: object) -> str:
+    if isinstance(value, Mapping):
+        return str(
+            value.get("text", value.get("token", value.get("word", value.get("value", ""))))
+        )
+    return str(value)
+
+
+def _token_confidence(value: object) -> float | None:
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("confidence", "score", "probability", "prob"):
+        if key in value and (confidence := _probability(value[key])) is not None:
+            return confidence
+    return None
+
+
+def _item_confidences(item: Mapping[str, Any], count: int) -> list[float | None]:
+    for key in (
+        "token_confidence",
+        "token_confidences",
+        "confidences",
+        "scores",
+        "confidence",
+        "score",
+    ):
+        value = item.get(key)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            confidences = [_probability(part) for part in value]
+            if len(confidences) == count:
+                return confidences
+        elif count == 1 and (confidence := _probability(value)) is not None:
+            # A sentence-level scalar must not be replicated and presented as
+            # independent character confidence.  Only a one-token result makes
+            # this value character-local.
+            return [confidence]
+    return [None] * count
+
+
+def _expand_timed_unit(
+    token: str,
+    start_ms: float,
+    end_ms: float,
+    *,
+    model_confidence: float | None,
+    timestamp_precision: str,
+    segment_index: int,
+) -> list[_ObservedCharacter]:
     normalized = normalize_with_mapping(_TAG_RE.sub("", token)).text
     if not normalized:
         return []
-    width = (end_ms - start_ms) / len(normalized)
+    precision = (
+        TIMESTAMP_PRECISION_CHARACTER
+        if len(normalized) == 1 and timestamp_precision == TIMESTAMP_PRECISION_CHARACTER
+        else timestamp_precision
+    )
+    character_confidence = model_confidence if len(normalized) == 1 else None
+    # A word/segment timestamp is deliberately attached to every contained
+    # character as one shared interval.  Never split it evenly and present the
+    # resulting boundaries as real character timestamps.
     return [
-        (character, start_ms + index * width, start_ms + (index + 1) * width)
-        for index, character in enumerate(normalized)
+        _ObservedCharacter(
+            character,
+            start_ms,
+            end_ms,
+            character_confidence,
+            precision,
+            segment_index,
+        )
+        for character in normalized
     ]
 
 
 def _numeric_pair(value: object) -> tuple[float, float] | None:
     if isinstance(value, Mapping):
         try:
-            return float(_get(value, "start", "start_ms")), float(
-                _get(value, "end", "end_ms")
+            return float(_get(value, "start", "start_ms", "begin")), float(
+                _get(value, "end", "end_ms", "stop")
             )
         except (AttributeError, TypeError, ValueError):
             return None
@@ -377,6 +972,125 @@ def _result_dicts(result: object) -> list[Mapping[str, Any]]:
     return []
 
 
+def _validated_timestamp_pairs(
+    raw_timestamps: object,
+    *,
+    multiplier: float,
+    window_start_ms: float,
+    window_end_ms: float | None,
+) -> tuple[list[tuple[int, float, float]], list[str]]:
+    if not isinstance(raw_timestamps, Sequence) or isinstance(raw_timestamps, (str, bytes)):
+        return [], []
+    pairs: list[tuple[int, float, float]] = []
+    diagnostics: list[str] = []
+    previous_start = previous_end = -1.0
+    maximum_relative = (
+        None if window_end_ms is None else max(0.0, window_end_ms - window_start_ms)
+    )
+    for index, raw in enumerate(raw_timestamps):
+        pair = _numeric_pair(raw)
+        if pair is None:
+            diagnostics.append(f"timestamp_pair_invalid:{index}")
+            continue
+        relative_start = pair[0] * multiplier
+        relative_end = pair[1] * multiplier
+        if (
+            not math.isfinite(relative_start)
+            or not math.isfinite(relative_end)
+            or relative_start < -_TIMESTAMP_EPSILON_MS
+            or relative_end - relative_start < _MIN_TIMESTAMP_SPAN_MS
+        ):
+            diagnostics.append(f"timestamp_interval_invalid:{index}")
+            continue
+        if (
+            maximum_relative is not None
+            and relative_end > maximum_relative + _TIMESTAMP_EPSILON_MS
+        ):
+            diagnostics.append(f"timestamp_outside_window:{index}")
+            continue
+        relative_start = max(0.0, relative_start)
+        if maximum_relative is not None:
+            relative_end = min(maximum_relative, relative_end)
+        if relative_end - relative_start < _MIN_TIMESTAMP_SPAN_MS:
+            diagnostics.append(f"timestamp_collapsed_after_clamp:{index}")
+            continue
+        if (
+            relative_start + _TIMESTAMP_EPSILON_MS < previous_start
+            or relative_end + _TIMESTAMP_EPSILON_MS < previous_end
+        ):
+            diagnostics.append(f"timestamp_not_monotonic:{index}")
+            continue
+        absolute_start = relative_start + window_start_ms
+        absolute_end = relative_end + window_start_ms
+        if absolute_end <= absolute_start:
+            diagnostics.append(f"timestamp_collapsed_after_clamp:{index}")
+            continue
+        pairs.append((index, absolute_start, absolute_end))
+        previous_start = max(previous_start, relative_start)
+        previous_end = max(previous_end, relative_end)
+    return pairs, diagnostics
+
+
+def voice_ranges_from_model_result(
+    result: object,
+    *,
+    time_offset_ms: float = 0.0,
+    timestamps_in_seconds: bool = False,
+    window_end_ms: float | None = None,
+) -> tuple[tuple[float, float], ...]:
+    """Extract validated, absolute VAD/sentence ranges from a FunASR result."""
+
+    if (
+        isinstance(time_offset_ms, bool)
+        or not math.isfinite(float(time_offset_ms))
+        or time_offset_ms < 0
+        or (
+            window_end_ms is not None
+            and (
+                isinstance(window_end_ms, bool)
+                or not math.isfinite(float(window_end_ms))
+                or window_end_ms <= time_offset_ms
+            )
+        )
+    ):
+        raise ValueError("invalid model timestamp window")
+    if not isinstance(timestamps_in_seconds, bool):
+        raise ValueError("timestamps_in_seconds must be boolean")
+    multiplier = 1000.0 if timestamps_in_seconds else 1.0
+    ranges: list[tuple[float, float]] = []
+    for item in _result_dicts(result):
+        for key in ("value", "segments", "vad", "sentence_info"):
+            raw_ranges = item.get(key)
+            validated, _diagnostics = _validated_timestamp_pairs(
+                raw_ranges,
+                multiplier=multiplier,
+                window_start_ms=time_offset_ms,
+                window_end_ms=window_end_ms,
+            )
+            ranges.extend((start_ms, end_ms) for _index, start_ms, end_ms in validated)
+    ranges.sort()
+    merged: list[tuple[float, float]] = []
+    for start_ms, end_ms in ranges:
+        if merged and start_ms <= merged[-1][1] + _TIMESTAMP_EPSILON_MS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_ms))
+        else:
+            merged.append((start_ms, end_ms))
+    return tuple(merged)
+
+
+def _segment_index_for_interval(
+    start_ms: float,
+    end_ms: float,
+    vad_ranges: Sequence[tuple[float, float]],
+    fallback_segment: int,
+) -> int:
+    midpoint = (start_ms + end_ms) / 2
+    for index, (vad_start, vad_end) in enumerate(vad_ranges):
+        if vad_start - _TIMESTAMP_EPSILON_MS <= midpoint <= vad_end + _TIMESTAMP_EPSILON_MS:
+            return index
+    return fallback_segment
+
+
 def _fa_serialized_tokens(text: str) -> list[str]:
     """Extract non-silence tokens from fa-zh's ``token start end;`` text."""
 
@@ -403,18 +1117,68 @@ def _observed_characters(
     time_offset_ms: float,
     timestamps_in_seconds: bool,
     forced_reference: bool = False,
-) -> list[tuple[str, float, float]]:
-    observed: list[tuple[str, float, float]] = []
+    window_end_ms: float | None = None,
+) -> tuple[
+    list[_ObservedCharacter],
+    tuple[str, ...],
+    bool,
+    tuple[tuple[float, float], ...],
+]:
+    observed: list[_ObservedCharacter] = []
+    diagnostics: list[str] = []
     multiplier = 1000.0 if timestamps_in_seconds else 1.0
+    vad_ranges = voice_ranges_from_model_result(
+        result,
+        time_offset_ms=time_offset_ms,
+        timestamps_in_seconds=timestamps_in_seconds,
+        window_end_ms=window_end_ms,
+    )
+    fallback_segment = 0
+    previous_unit_end: float | None = None
+
+    def append_unit(
+        token: str,
+        start_ms: float,
+        end_ms: float,
+        confidence: float | None,
+        precision: str,
+    ) -> None:
+        nonlocal fallback_segment, previous_unit_end
+        if (
+            not vad_ranges
+            and previous_unit_end is not None
+            and start_ms - previous_unit_end >= _VAD_GAP_MS
+        ):
+            fallback_segment += 1
+        segment_index = _segment_index_for_interval(
+            start_ms,
+            end_ms,
+            vad_ranges,
+            fallback_segment,
+        )
+        observed.extend(
+            _expand_timed_unit(
+                token,
+                start_ms,
+                end_ms,
+                model_confidence=confidence,
+                timestamp_precision=precision,
+                segment_index=segment_index,
+            )
+        )
+        previous_unit_end = end_ms if previous_unit_end is None else max(previous_unit_end, end_ms)
 
     for item in _result_dicts(result):
         raw_timestamps = item.get("timestamp", item.get("timestamps", item.get("time_stamp")))
-        pairs = (
-            [pair for raw in raw_timestamps if (pair := _numeric_pair(raw)) is not None]
-            if isinstance(raw_timestamps, Sequence)
-            and not isinstance(raw_timestamps, (str, bytes))
-            else []
+        if raw_timestamps is None:
+            diagnostics.append("timestamps_missing")
+        pairs, pair_diagnostics = _validated_timestamp_pairs(
+            raw_timestamps,
+            multiplier=multiplier,
+            window_start_ms=time_offset_ms,
+            window_end_ms=window_end_ms,
         )
+        diagnostics.extend(pair_diagnostics)
         if not pairs:
             # Some FunASR versions expose only segment-level information. When
             # character timestamps are present they take precedence; consuming
@@ -424,43 +1188,86 @@ def _observed_characters(
             if isinstance(sentence_info, Sequence) and not isinstance(
                 sentence_info, (str, bytes)
             ):
-                for sentence in sentence_info:
+                sentence_pairs, sentence_diagnostics = _validated_timestamp_pairs(
+                    sentence_info,
+                    multiplier=multiplier,
+                    window_start_ms=time_offset_ms,
+                    window_end_ms=window_end_ms,
+                )
+                diagnostics.extend(sentence_diagnostics)
+                for sentence_index, start_ms, end_ms in sentence_pairs:
+                    sentence = sentence_info[sentence_index]
                     if not isinstance(sentence, Mapping):
                         continue
-                    pair = _numeric_pair(sentence)
                     text = str(sentence.get("text", ""))
-                    if pair is not None:
-                        observed.extend(
-                            _partition_token(
-                                text,
-                                pair[0] * multiplier + time_offset_ms,
-                                pair[1] * multiplier + time_offset_ms,
-                            )
-                        )
+                    confidence = next(
+                        (
+                            value
+                            for key in ("confidence", "score", "probability", "prob")
+                            if (value := _probability(sentence.get(key))) is not None
+                        ),
+                        None,
+                    )
+                    append_unit(
+                        text,
+                        start_ms,
+                        end_ms,
+                        confidence,
+                        TIMESTAMP_PRECISION_SEGMENT,
+                    )
             continue
 
         raw_tokens = item.get("tokens", item.get("token"))
         text = str(item.get("text", item.get("sentence", item.get("transcript", ""))))
         serialized_tokens = _fa_serialized_tokens(text) if forced_reference else []
-        if forced_reference and len(pairs) == len(reference.text):
+        raw_pair_count = (
+            len(raw_timestamps)
+            if isinstance(raw_timestamps, Sequence)
+            and not isinstance(raw_timestamps, (str, bytes))
+            else 0
+        )
+        confidences = _item_confidences(item, raw_pair_count)
+        token_confidences: list[float | None] = [None] * raw_pair_count
+        if forced_reference and raw_pair_count == len(reference.text):
             # fa-zh returns authoritative token timestamps but serializes its
             # human-readable ``text`` as ``token start end;`` records.  That
             # field must not be normalized as recognized prose: its timing
-            # digits otherwise create false SequenceMatcher coverage and move
+            # digits otherwise create false alignment coverage and move
             # every boundary.  The model contract states that ``timestamp``
             # excludes silence and is aligned one-to-one with input tokens.
             tokens = list(reference.text)
-        elif forced_reference and len(serialized_tokens) == len(pairs):
+            precisions = [TIMESTAMP_PRECISION_CHARACTER] * raw_pair_count
+        elif forced_reference and len(serialized_tokens) == raw_pair_count:
             # Tokenization can legitimately group Latin words or multiple
             # characters.  In that case parse the fa-zh serialization and let
-            # the normal reference SequenceMatcher map those real tokens.
+            # the normal monotonic matcher map those real tokens.
             tokens = serialized_tokens
+            precisions = [
+                TIMESTAMP_PRECISION_CHARACTER
+                if len(normalize_with_mapping(token).text) == 1
+                else TIMESTAMP_PRECISION_TOKEN
+                for token in tokens
+            ]
         elif isinstance(raw_tokens, Sequence) and not isinstance(raw_tokens, (str, bytes)):
-            tokens = [str(token) for token in raw_tokens]
+            tokens = [_token_text(token) for token in raw_tokens]
+            token_confidences = [_token_confidence(token) for token in raw_tokens]
+            token_confidences.extend([None] * max(0, raw_pair_count - len(token_confidences)))
+            precisions = [
+                TIMESTAMP_PRECISION_CHARACTER
+                if len(normalize_with_mapping(token).text) == 1
+                else TIMESTAMP_PRECISION_TOKEN
+                for token in tokens
+            ]
         else:
             whitespace_tokens = _TAG_RE.sub("", text).split()
-            if len(whitespace_tokens) == len(pairs):
+            if len(whitespace_tokens) == raw_pair_count:
                 tokens = whitespace_tokens
+                precisions = [
+                    TIMESTAMP_PRECISION_CHARACTER
+                    if len(normalize_with_mapping(token).text) == 1
+                    else TIMESTAMP_PRECISION_TOKEN
+                    for token in tokens
+                ]
             else:
                 normalized_output = normalize_with_mapping(_TAG_RE.sub("", text)).text
                 if not normalized_output and forced_reference:
@@ -471,26 +1278,39 @@ def _observed_characters(
                     # particular, never manufacture coverage merely because a
                     # backend happened to return timestamp pairs.
                     continue
-                if len(normalized_output) == len(pairs):
+                if len(normalized_output) == raw_pair_count:
                     tokens = list(normalized_output)
+                    precisions = [TIMESTAMP_PRECISION_CHARACTER] * raw_pair_count
                 else:
                     # Last-resort grouping for wordpiece/English results whose
                     # token list was not returned by this FunASR version.
                     tokens = []
-                    for index in range(len(pairs)):
-                        left = round(index * len(normalized_output) / len(pairs))
-                        right = round((index + 1) * len(normalized_output) / len(pairs))
+                    for index in range(raw_pair_count):
+                        left = round(index * len(normalized_output) / raw_pair_count)
+                        right = round((index + 1) * len(normalized_output) / raw_pair_count)
                         tokens.append(normalized_output[left:right])
+                    precisions = [TIMESTAMP_PRECISION_TOKEN] * raw_pair_count
 
-        for token, pair in zip(tokens, pairs, strict=False):
-            observed.extend(
-                _partition_token(
-                    token,
-                    pair[0] * multiplier + time_offset_ms,
-                    pair[1] * multiplier + time_offset_ms,
-                )
+        for pair_index, start_ms, end_ms in pairs:
+            if pair_index >= len(tokens):
+                diagnostics.append(f"timestamp_without_token:{pair_index}")
+                continue
+            confidence = (
+                token_confidences[pair_index]
+                if pair_index < len(token_confidences)
+                and token_confidences[pair_index] is not None
+                else confidences[pair_index]
             )
-    return observed
+            append_unit(
+                tokens[pair_index],
+                start_ms,
+                end_ms,
+                confidence,
+                precisions[pair_index],
+            )
+    if not observed and not diagnostics:
+        diagnostics.append("timestamped_tokens_unavailable")
+    return observed, tuple(dict.fromkeys(diagnostics)), not diagnostics, vad_ranges
 
 
 def alignment_track_from_model_result(
@@ -501,42 +1321,99 @@ def alignment_track_from_model_result(
     time_offset_ms: float = 0.0,
     timestamps_in_seconds: bool = False,
     forced_reference: bool = False,
+    window_end_ms: float | None = None,
 ) -> AlignmentTrack:
     """Convert common FunASR result shapes into normalized-reference spans."""
 
+    if (
+        isinstance(time_offset_ms, bool)
+        or not math.isfinite(float(time_offset_ms))
+        or time_offset_ms < 0
+        or (
+            window_end_ms is not None
+            and (
+                isinstance(window_end_ms, bool)
+                or not math.isfinite(float(window_end_ms))
+                or window_end_ms <= time_offset_ms
+            )
+        )
+    ):
+        raise ValueError("invalid model timestamp window")
+    if not isinstance(timestamps_in_seconds, bool):
+        raise ValueError("timestamps_in_seconds must be boolean")
     reference = normalize_with_mapping(transcript)
     if not reference.text:
         return AlignmentTrack((), engine, 0.0)
-    observed = _observed_characters(
+    observed, timestamp_diagnostics, timestamp_valid, vad_ranges = _observed_characters(
         result,
         reference,
         time_offset_ms=time_offset_ms,
         timestamps_in_seconds=timestamps_in_seconds,
         forced_reference=forced_reference,
+        window_end_ms=window_end_ms,
     )
-    observed_text = "".join(character for character, _start, _end in observed)
-    spans: list[TimedSpan] = []
-    covered: set[int] = set()
-    for normalized_index, observed_index, confidence in _matching_character_pairs(
+    observed_text = "".join(character.text for character in observed)
+    alignment = _monotonic_character_alignment(
         reference.text,
         observed_text,
         allow_phonetic_fallback=not forced_reference,
-    ):
-        _character, start_ms, end_ms = observed[observed_index]
-        if end_ms <= start_ms or start_ms < 0:
-            continue
+        reference_segments=_reference_segment_indexes(transcript, reference),
+        observed_segments=tuple(character.segment_index for character in observed),
+    )
+    spans: list[TimedSpan] = []
+    covered: set[int] = set()
+    for normalized_index, observed_index, confidence in alignment.pairs:
+        character = observed[observed_index]
         spans.append(
             TimedSpan(
                 normalized_index,
                 normalized_index + 1,
-                start_ms,
-                end_ms,
+                character.start_ms,
+                character.end_ms,
                 confidence,
+                character.model_confidence,
+                character.timestamp_precision,
+                alignment.margins.get(normalized_index, 1.0),
             )
         )
         covered.add(normalized_index)
     spans.sort(key=lambda span: (span.normalized_start, span.start_ms))
-    return AlignmentTrack(tuple(spans), engine, len(covered) / len(reference.text))
+    model_confidences = [
+        span.model_confidence for span in spans if span.model_confidence is not None
+    ]
+    precision = max(
+        (span.timestamp_precision for span in spans),
+        key=lambda value: _PRECISION_RANK[value],
+        default=TIMESTAMP_PRECISION_UNKNOWN,
+    )
+    diagnostics = list(timestamp_diagnostics)
+    diagnostics.append(
+        f"timestamp_unit:{'seconds' if timestamps_in_seconds else 'milliseconds'}"
+    )
+    diagnostics.append("matching_strategy:anchored_monotonic_dp")
+    if alignment.forced_partition:
+        diagnostics.append("dp_forced_partition")
+    if not vad_ranges and not forced_reference:
+        diagnostics.append("vad_ranges_unavailable")
+    return AlignmentTrack(
+        tuple(spans),
+        engine,
+        len(covered) / len(reference.text),
+        sum(model_confidences) / len(model_confidences) if model_confidences else None,
+        min(model_confidences) if model_confidences else None,
+        (
+            sum(value < _LOW_MODEL_CONFIDENCE_THRESHOLD for value in model_confidences)
+            / len(model_confidences)
+            if model_confidences
+            else None
+        ),
+        precision,
+        timestamp_valid,
+        alignment.ambiguity_margin,
+        tuple(dict.fromkeys(diagnostics)),
+        vad_ranges,
+        len(model_confidences) / len(spans) if spans else 0.0,
+    )
 
 
 def recognition_tokens_from_model_result(
@@ -544,19 +1421,27 @@ def recognition_tokens_from_model_result(
     *,
     time_offset_ms: float = 0.0,
     timestamps_in_seconds: bool = False,
+    window_end_ms: float | None = None,
 ) -> tuple[RecognizedToken, ...]:
     """Convert a raw FunASR result into timestamped display characters."""
 
-    observed = _observed_characters(
+    observed, _diagnostics, _timestamp_valid, _vad_ranges = _observed_characters(
         result,
         normalize_with_mapping(""),
         time_offset_ms=time_offset_ms,
         timestamps_in_seconds=timestamps_in_seconds,
+        window_end_ms=window_end_ms,
     )
     tokens = [
-        RecognizedToken(character, start_ms, end_ms)
-        for character, start_ms, end_ms in observed
-        if character and end_ms > start_ms >= 0
+        RecognizedToken(
+            character.text,
+            character.start_ms,
+            character.end_ms,
+            character.model_confidence if character.model_confidence is not None else 0.0,
+            character.model_confidence is not None,
+            character.timestamp_precision,
+        )
+        for character in observed
     ]
     tokens.sort(key=lambda token: (token.start_ms, token.end_ms))
     return tuple(tokens)
@@ -606,12 +1491,13 @@ class FunASRForceAligner:
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
             try:
-                result = self._get_model().generate(
-                    input=(str(window), transcript),
-                    data_type=("sound", "text"),
-                    disable_pbar=True,
-                    disable_log=True,
-                )
+                with model_execution_guard():
+                    result = self._get_model().generate(
+                        input=(str(window), transcript),
+                        data_type=("sound", "text"),
+                        disable_pbar=True,
+                        disable_log=True,
+                    )
             except Exception as exc:
                 raise ModelUnavailableError(f"fa-zh 本地推理失败: {exc}") from exc
         return alignment_track_from_model_result(
@@ -621,6 +1507,7 @@ class FunASRForceAligner:
             time_offset_ms=window_start_ms,
             timestamps_in_seconds=self.timestamps_in_seconds,
             forced_reference=True,
+            window_end_ms=window_end_ms,
         )
 
 
@@ -682,14 +1569,15 @@ class FunASRAsrAligner:
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
             try:
-                result = self._get_model().generate(
-                    input=str(window),
-                    batch_size_s=300,
-                    use_itn=False,
-                    pred_timestamp=True,
-                    disable_pbar=True,
-                    disable_log=True,
-                )
+                with model_execution_guard():
+                    result = self._get_model().generate(
+                        input=str(window),
+                        batch_size_s=300,
+                        use_itn=False,
+                        pred_timestamp=True,
+                        disable_pbar=True,
+                        disable_log=True,
+                    )
             except Exception as exc:
                 raise ModelUnavailableError(f"paraformer-zh 本地推理失败: {exc}") from exc
         return alignment_track_from_model_result(
@@ -698,6 +1586,7 @@ class FunASRAsrAligner:
             engine="paraformer-zh+fsmn-vad",
             time_offset_ms=window_start_ms,
             timestamps_in_seconds=self.timestamps_in_seconds,
+            window_end_ms=window_end_ms,
         )
 
     def recognize(
@@ -709,6 +1598,22 @@ class FunASRAsrAligner:
     ) -> tuple[RecognizedToken, ...]:
         """Recognize one audio window without requiring a reference transcript."""
 
+        tokens, _result = self.recognize_with_result(
+            audio_path=audio_path,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+        )
+        return tokens
+
+    def recognize_with_result(
+        self,
+        *,
+        audio_path: str | Path,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> tuple[tuple[RecognizedToken, ...], object]:
+        """Return display tokens together with raw local model segmentation metadata."""
+
         with local_audio_window(
             audio_path,
             start_ms=window_start_ms,
@@ -716,20 +1621,25 @@ class FunASRAsrAligner:
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
             try:
-                result = self._get_model().generate(
-                    input=str(window),
-                    batch_size_s=300,
-                    use_itn=False,
-                    pred_timestamp=True,
-                    disable_pbar=True,
-                    disable_log=True,
-                )
+                with model_execution_guard():
+                    result = self._get_model().generate(
+                        input=str(window),
+                        batch_size_s=300,
+                        use_itn=False,
+                        pred_timestamp=True,
+                        disable_pbar=True,
+                        disable_log=True,
+                    )
             except Exception as exc:
                 raise ModelUnavailableError(f"paraformer-zh 本地转写失败: {exc}") from exc
-        return recognition_tokens_from_model_result(
+        return (
+            recognition_tokens_from_model_result(
+                result,
+                time_offset_ms=window_start_ms,
+                timestamps_in_seconds=self.timestamps_in_seconds,
+                window_end_ms=window_end_ms,
+            ),
             result,
-            time_offset_ms=window_start_ms,
-            timestamps_in_seconds=self.timestamps_in_seconds,
         )
 
 
@@ -751,6 +1661,20 @@ def _coerce_track(value: object, engine: str, reference_length: int) -> Alignmen
                 float(_get(raw, "start_ms")),
                 float(_get(raw, "end_ms")),
                 float(_get(raw, "confidence", default=1.0)),
+                (
+                    float(model_confidence)
+                    if (model_confidence := _get(raw, "model_confidence", default=None))
+                    is not None
+                    else None
+                ),
+                str(
+                    _get(
+                        raw,
+                        "timestamp_precision",
+                        default=TIMESTAMP_PRECISION_UNKNOWN,
+                    )
+                ),
+                float(_get(raw, "alignment_margin", default=1.0)),
             )
         spans.append(span)
         covered.update(range(span.normalized_start, span.normalized_end))
@@ -760,7 +1684,48 @@ def _coerce_track(value: object, engine: str, reference_length: int) -> Alignmen
         if supplied_coverage is not None
         else min(1.0, len(covered) / max(1, reference_length))
     )
-    return AlignmentTrack(tuple(spans), str(_get(value, "engine", default=engine)), coverage)
+    model_confidences = [
+        span.model_confidence for span in spans if span.model_confidence is not None
+    ]
+    precision = max(
+        (span.timestamp_precision for span in spans),
+        key=lambda item: _PRECISION_RANK[item],
+        default=TIMESTAMP_PRECISION_UNKNOWN,
+    )
+    timestamp_valid = _get(value, "timestamp_valid", default=True)
+    if not isinstance(timestamp_valid, bool):
+        raise ValueError("timestamp_valid must be boolean")
+    return AlignmentTrack(
+        tuple(spans),
+        str(_get(value, "engine", default=engine)),
+        coverage,
+        float(mean_confidence)
+        if (mean_confidence := _get(value, "mean_model_confidence", default=None))
+        is not None
+        else (sum(model_confidences) / len(model_confidences) if model_confidences else None),
+        float(minimum_confidence)
+        if (minimum_confidence := _get(value, "minimum_model_confidence", default=None))
+        is not None
+        else (min(model_confidences) if model_confidences else None),
+        float(low_ratio)
+        if (low_ratio := _get(value, "low_confidence_ratio", default=None)) is not None
+        else None,
+        str(_get(value, "timestamp_precision", default=precision)),
+        timestamp_valid,
+        float(_get(value, "ambiguity_margin", default=1.0)),
+        tuple(str(item) for item in _get(value, "diagnostics", default=())),
+        tuple(
+            (float(start), float(end))
+            for start, end in _get(value, "vad_ranges", default=())
+        ),
+        float(
+            _get(
+                value,
+                "model_confidence_coverage",
+                default=(len(model_confidences) / len(spans) if spans else 0.0),
+            )
+        ),
+    )
 
 
 def _invoke_aligner(
@@ -783,9 +1748,22 @@ def _invoke_aligner(
             window_end_ms=window_end_ms,
         )
         return _coerce_track(result, engine, reference_length)
-    except Exception:
+    except ModelUnavailableError:
         # One corrupt paragraph or missing optional runtime must never result in
         # an unsafe automatic cut.  The caller records an explicit fallback.
+        return None
+    except (TypeError, ValueError, OverflowError) as exc:
+        # Preserve a machine-readable rejection instead of silently degrading a
+        # malformed timestamp result to an apparently healthy empty alignment.
+        return AlignmentTrack(
+            (),
+            engine,
+            0.0,
+            timestamp_precision=TIMESTAMP_PRECISION_UNKNOWN,
+            timestamp_valid=False,
+            diagnostics=(f"aligner_result_rejected:{type(exc).__name__}",),
+        )
+    except Exception:
         return None
 
 
@@ -796,10 +1774,11 @@ def _range_from_track(
     *,
     cap_by_track_coverage: bool = True,
     max_internal_gap_ms: float | None = None,
-) -> tuple[float, float, float] | None:
+) -> AlignmentRange | None:
     if track is None or normalized_end <= normalized_start:
         return None
     intervals: list[tuple[int, int, float, float]] = []
+    selected_spans: list[TimedSpan] = []
     covered: set[int] = set()
     for span in track.spans:
         left = max(normalized_start, span.normalized_start)
@@ -818,6 +1797,7 @@ def _range_from_track(
                 span.start_ms + relative_right * duration,
             )
         )
+        selected_spans.append(span)
         covered.update(range(left, right))
     if not intervals:
         return None
@@ -832,11 +1812,66 @@ def _range_from_track(
             previous_end_ms = max(previous_end_ms, end_ms)
     local_coverage = len(covered) / (normalized_end - normalized_start)
     coverage = min(local_coverage, track.coverage) if cap_by_track_coverage else local_coverage
-    return (
-        min(interval[2] for interval in intervals),
-        max(interval[3] for interval in intervals),
-        coverage,
+    start_ms = min(interval[2] for interval in intervals)
+    end_ms = max(interval[3] for interval in intervals)
+    model_confidences = [
+        span.model_confidence
+        for span in selected_spans
+        if span.model_confidence is not None
+    ]
+    precision = max(
+        (span.timestamp_precision for span in selected_spans),
+        key=lambda value: _PRECISION_RANK[value],
+        default=track.timestamp_precision,
     )
+    overlapping_vad = [
+        (vad_start, vad_end)
+        for vad_start, vad_end in track.vad_ranges
+        if vad_end >= start_ms and vad_start <= end_ms
+    ]
+    return AlignmentRange(
+        start_ms,
+        end_ms,
+        coverage,
+        sum(model_confidences) / len(model_confidences) if model_confidences else None,
+        min(model_confidences) if model_confidences else None,
+        (
+            sum(value < _LOW_MODEL_CONFIDENCE_THRESHOLD for value in model_confidences)
+            / len(model_confidences)
+            if model_confidences
+            else None
+        ),
+        precision,
+        min((span.alignment_margin for span in selected_spans), default=track.ambiguity_margin),
+        track.timestamp_valid,
+        len(model_confidences) / len(selected_spans) if selected_spans else 0.0,
+        min((item[0] for item in overlapping_vad), default=None),
+        max((item[1] for item in overlapping_vad), default=None),
+    )
+
+
+def _neighbor_guards_from_track(
+    track: AlignmentTrack | None,
+    normalized_start: int,
+    normalized_end: int,
+) -> tuple[float | None, float | None]:
+    if track is None:
+        return None, None
+    preceding = [
+        span
+        for span in track.spans
+        if span.normalized_end <= normalized_start
+    ]
+    following = [
+        span
+        for span in track.spans
+        if span.normalized_start >= normalized_end
+    ]
+    left_guard = max((span.end_ms for span in preceding), default=None)
+    right_guard = min((span.start_ms for span in following), default=None)
+    if left_guard is not None and right_guard is not None and right_guard <= left_guard:
+        return None, None
+    return left_guard, right_guard
 
 
 def _count_occurrences(haystack: str, needle: str) -> int:
@@ -934,14 +1969,73 @@ def _context_excerpt(
 
 
 def _average_ranges(
-    ranges: Sequence[tuple[float, float, float]],
-) -> tuple[float, float, float]:
+    ranges: Sequence[AlignmentRange],
+) -> AlignmentRange:
     count = len(ranges)
-    return (
-        sum(item[0] for item in ranges) / count,
-        sum(item[1] for item in ranges) / count,
-        min(item[2] for item in ranges),
+    mean_confidences = [
+        item.mean_model_confidence
+        for item in ranges
+        if item.mean_model_confidence is not None
+    ]
+    minimum_confidences = [
+        item.minimum_model_confidence
+        for item in ranges
+        if item.minimum_model_confidence is not None
+    ]
+    low_ratios = [item.low_confidence_ratio for item in ranges if item.low_confidence_ratio is not None]
+    return AlignmentRange(
+        sum(item.start_ms for item in ranges) / count,
+        sum(item.end_ms for item in ranges) / count,
+        min(item.coverage for item in ranges),
+        sum(mean_confidences) / len(mean_confidences) if mean_confidences else None,
+        min(minimum_confidences) if minimum_confidences else None,
+        max(low_ratios) if low_ratios else None,
+        max(ranges, key=lambda item: _PRECISION_RANK[item.timestamp_precision]).timestamp_precision,
+        min(item.ambiguity_margin for item in ranges),
+        all(item.timestamp_valid for item in ranges),
+        min(item.model_confidence_coverage for item in ranges),
+        min(
+            (item.vad_start_ms for item in ranges if item.vad_start_ms is not None),
+            default=None,
+        ),
+        max(
+            (item.vad_end_ms for item in ranges if item.vad_end_ms is not None),
+            default=None,
+        ),
     )
+
+
+def _range_diagnostics(value: AlignmentRange | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "start_ms": round(value.start_ms, 3),
+        "end_ms": round(value.end_ms, 3),
+        "coverage": round(value.coverage, 4),
+        "mean_model_confidence": (
+            round(value.mean_model_confidence, 4)
+            if value.mean_model_confidence is not None
+            else None
+        ),
+        "minimum_model_confidence": (
+            round(value.minimum_model_confidence, 4)
+            if value.minimum_model_confidence is not None
+            else None
+        ),
+        "low_confidence_ratio": (
+            round(value.low_confidence_ratio, 4)
+            if value.low_confidence_ratio is not None
+            else None
+        ),
+        "timestamp_precision": value.timestamp_precision,
+        "timestamp_valid": value.timestamp_valid,
+        "model_confidence_coverage": round(value.model_confidence_coverage, 4),
+        "alignment_margin": round(value.ambiguity_margin, 4),
+        "vad_start_ms": (
+            round(value.vad_start_ms, 3) if value.vad_start_ms is not None else None
+        ),
+        "vad_end_ms": round(value.vad_end_ms, 3) if value.vad_end_ms is not None else None,
+    }
 
 
 def align_transcript(
@@ -975,6 +2069,15 @@ def align_transcript(
         raise ValueError("window_padding_ms must not be negative")
     if local_recognition_padding_ms < 0:
         raise ValueError("local_recognition_padding_ms must not be negative")
+    if not math.isfinite(boundary_tolerance_ms) or boundary_tolerance_ms <= 0:
+        raise ValueError("boundary_tolerance_ms must be positive and finite")
+    for label, value in (
+        ("minimum_force_coverage", minimum_force_coverage),
+        ("minimum_asr_coverage", minimum_asr_coverage),
+        ("auto_approve_threshold", auto_approve_threshold),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{label} must be between zero and one")
     sample_rate = int(_get(audio_info, "sample_rate", "samplerate"))
     total_samples_value = _get(
         audio_info,
@@ -1024,9 +2127,6 @@ def align_transcript(
         window_end_ms=audio_end_ms,
         reference_length=normalized_total,
     )
-    if global_asr_track is not None and not global_asr_track.spans:
-        global_asr_track = None
-
     total_paragraphs = len(paragraphs)
     if progress_cb is not None:
         progress_cb(0, total_paragraphs)
@@ -1111,6 +2211,8 @@ def align_transcript(
             )
 
         for highlight_index, highlight in enumerate(highlights):
+            if _is_cancelled(cancel):
+                raise AlignmentCancelledError("alignment was cancelled")
             original_start = int(_get(highlight, "start", "start_offset", "char_start"))
             original_end = int(_get(highlight, "end", "end_offset", "char_end"))
             if original_start < 0 or original_end <= original_start or original_end > len(text):
@@ -1119,6 +2221,11 @@ def align_transcript(
                 )
             marked = str(_get(highlight, "text", default=text[original_start:original_end]))
             normalized_range = normalized.normalized_range(original_start, original_end)
+            if normalized_range is None:
+                # Parser-produced transcripts already filter these, but the
+                # duck-typed public API may receive external paragraph objects.
+                # Never turn punctuation-only formatting into an audio cut.
+                continue
             force_range = None
             force_track_available = False
             force_context_unstable = False
@@ -1181,6 +2288,8 @@ def align_transcript(
                                 window_end_ms=refinement_end,
                                 reference_length=len(normalized.text),
                             )
+                            if _is_cancelled(cancel):
+                                raise AlignmentCancelledError("alignment was cancelled")
                     local_asr_range = _range_from_track(
                         local_asr_track,
                         normalized_start,
@@ -1239,9 +2348,11 @@ def align_transcript(
                     # ASR-located target; agreement across those passes guards
                     # against a forced aligner inventing positions for text
                     # that was not actually spoken.
-                    contextual_ranges: list[tuple[float, float, float]] = []
+                    contextual_ranges: list[AlignmentRange] = []
                     seen_windows: set[tuple[str, int, int]] = set()
                     for context_radius in (10, 20):
+                        if _is_cancelled(cancel):
+                            raise AlignmentCancelledError("alignment was cancelled")
                         excerpt_data = _context_excerpt(
                             normalized,
                             normalized_start,
@@ -1378,6 +2489,43 @@ def align_transcript(
                 total_samples=total_samples,
             )
 
+            active_asr_track = (
+                local_asr_track
+                if has_local_refinement
+                else (global_asr_track if has_observed_paragraph else anchor_asr_track)
+            )
+            if has_local_refinement and local_asr_track is not None:
+                guard_track = local_asr_track
+                guard_start = normalized_start
+                guard_end = normalized_end
+            elif has_observed_paragraph and global_asr_track is not None:
+                guard_track = global_asr_track
+                guard_start = paragraph_base + normalized_start
+                guard_end = paragraph_base + normalized_end
+            else:
+                guard_track = anchor_asr_track
+                guard_start = normalized_start
+                guard_end = normalized_end
+            left_guard_ms, right_guard_ms = _neighbor_guards_from_track(
+                guard_track,
+                guard_start,
+                guard_end,
+            )
+            left_guard_sample = (
+                max(0, min(total_samples, round(left_guard_ms * sample_rate / 1000)))
+                if left_guard_ms is not None
+                else None
+            )
+            right_guard_sample = (
+                max(0, min(total_samples, round(right_guard_ms * sample_rate / 1000)))
+                if right_guard_ms is not None
+                else None
+            )
+            if left_guard_sample is not None and left_guard_sample >= end_sample:
+                left_guard_sample = None
+            if right_guard_sample is not None and right_guard_sample <= start_sample:
+                right_guard_sample = None
+
             short = normalized_length <= 2
             repeated = _context_is_repeated(
                 normalized,
@@ -1385,16 +2533,14 @@ def align_transcript(
                 marked,
                 corpus=global_normalized_text,
             )
-            force_coverage = force_range[2] if force_range is not None else 0.0
-            asr_coverage = asr_range[2] if asr_range is not None else 0.0
+            force_coverage = force_range.coverage if force_range is not None else 0.0
+            asr_coverage = asr_range.coverage if asr_range is not None else 0.0
             insufficient = (
                 force_range is not None and force_coverage < minimum_force_coverage
             ) or (asr_range is not None and asr_coverage < minimum_asr_coverage)
+            insufficient = insufficient or (force_track_available and force_range is None)
             insufficient = insufficient or (
-                force_track_available and force_range is None
-            ) or (
-                (local_asr_track if has_local_refinement else global_asr_track) is not None
-                and asr_range is None
+                active_asr_track is not None and asr_range is None
             )
             insufficient = insufficient or observed_context_insufficient
             insufficient = insufficient or (
@@ -1403,17 +2549,68 @@ def align_transcript(
                 and force_range is None
             )
             if force_range is not None and asr_range is not None:
-                boundary_difference = max(
-                    abs(force_range[0] - asr_range[0]),
-                    abs(force_range[1] - asr_range[1]),
+                boundary_difference: float | None = max(
+                    abs(force_range.start_ms - asr_range.start_ms),
+                    abs(force_range.end_ms - asr_range.end_ms),
                 )
             else:
-                boundary_difference = float("inf")
+                boundary_difference = None
             disagreement = (
-                force_range is not None
-                and asr_range is not None
+                boundary_difference is not None
                 and boundary_difference > boundary_tolerance_ms
             )
+            timestamp_anomaly = any(
+                item is not None and not item.timestamp_valid
+                for item in (asr_range, force_range)
+            ) or (active_asr_track is not None and not active_asr_track.timestamp_valid)
+            coarse_timestamp = any(
+                item is not None
+                and item.timestamp_precision != TIMESTAMP_PRECISION_CHARACTER
+                for item in (asr_range, force_range)
+            )
+            ambiguity_margin = min(
+                (
+                    item.ambiguity_margin
+                    for item in (asr_range, force_range)
+                    if item is not None
+                ),
+                default=0.0,
+            )
+            dp_forced_partition = bool(
+                active_asr_track is not None
+                and "dp_forced_partition" in active_asr_track.diagnostics
+            )
+            ambiguous = asr_range is not None and (
+                ambiguity_margin < _MIN_ALIGNMENT_MARGIN or dp_forced_partition
+            )
+            model_confidence_unavailable = (
+                asr_range is not None and asr_range.model_confidence_coverage < 1.0
+            )
+            low_model_confidence = bool(
+                asr_range is not None
+                and asr_range.mean_model_confidence is not None
+                and (
+                    asr_range.mean_model_confidence < 0.72
+                    or (
+                        asr_range.minimum_model_confidence is not None
+                        and asr_range.minimum_model_confidence < 0.40
+                    )
+                    or (
+                        asr_range.low_confidence_ratio is not None
+                        and asr_range.low_confidence_ratio > 0.20
+                    )
+                )
+            )
+            guard_unavailable = left_guard_sample is None or right_guard_sample is None
+            candidate_span_ms = max(0.0, proposed_end_ms - proposed_start_ms)
+            duration_anomaly = (
+                candidate_span_ms > max(4_000.0, normalized_length * 1_200.0)
+                or (
+                    normalized_length >= 3
+                    and candidate_span_ms < normalized_length * 15.0
+                )
+            )
+            timestamp_anomaly = timestamp_anomaly or duration_anomaly
 
             reasons: list[str] = []
             if fallback:
@@ -1424,24 +2621,36 @@ def align_transcript(
                 reasons.append(SHORT_HIGHLIGHT)
             if repeated:
                 reasons.append(REPEATED_CONTEXT)
+            if ambiguous:
+                reasons.append(ALIGNMENT_AMBIGUOUS)
             if insufficient:
                 reasons.append(INSUFFICIENT_COVERAGE)
             if disagreement:
                 reasons.append(BOUNDARY_DISAGREEMENT)
             if force_context_unstable:
                 reasons.append(FORCE_CONTEXT_UNSTABLE)
+            if timestamp_anomaly:
+                reasons.append(TIMESTAMP_ANOMALY)
+            if coarse_timestamp:
+                reasons.append(COARSE_TIMESTAMP)
+            if model_confidence_unavailable:
+                reasons.append(MODEL_CONFIDENCE_UNAVAILABLE)
+            if low_model_confidence:
+                reasons.append(LOW_MODEL_CONFIDENCE)
+            if guard_unavailable:
+                reasons.append(BOUNDARY_GUARD_UNAVAILABLE)
             if has_observed_paragraph and not has_local_refinement:
                 reasons.append(LOCAL_RECOGNITION_UNAVAILABLE)
             if force_aligner is None:
                 reasons.append(FORCE_ALIGNER_UNAVAILABLE)
-            if (local_asr_track if has_local_refinement else global_asr_track) is None:
+            if active_asr_track is None:
                 reasons.append(ASR_ALIGNER_UNAVAILABLE)
 
             if fallback:
                 confidence = 0.15
             elif force_range is not None and asr_range is not None:
                 confidence = 0.55 + 0.25 * force_coverage + 0.12 * asr_coverage
-                if not disagreement:
+                if not disagreement and boundary_difference is not None:
                     confidence += 0.08 * max(
                         0.0, 1.0 - boundary_difference / boundary_tolerance_ms
                     )
@@ -1449,16 +2658,34 @@ def align_transcript(
                 confidence = 0.45 + 0.30 * force_coverage
             else:
                 confidence = 0.25 + 0.30 * asr_coverage
+            if (
+                asr_range is not None
+                and asr_range.mean_model_confidence is not None
+                and not model_confidence_unavailable
+            ):
+                confidence = 0.72 * confidence + 0.28 * asr_range.mean_model_confidence
+            elif model_confidence_unavailable:
+                confidence = min(confidence, 0.69)
             if short:
                 confidence -= 0.20
             if repeated:
                 confidence -= 0.12
+            if ambiguous:
+                confidence -= 0.20
             if insufficient:
                 confidence -= 0.20
             if disagreement:
                 confidence -= 0.25
             if force_context_unstable:
                 confidence -= 0.12
+            if coarse_timestamp:
+                confidence -= 0.18
+            if low_model_confidence:
+                confidence -= 0.18
+            if guard_unavailable:
+                confidence -= 0.08
+            if timestamp_anomaly:
+                confidence = min(confidence, 0.20)
             confidence = round(max(0.0, min(0.99, confidence)), 4)
 
             auto_approved = (
@@ -1467,13 +2694,65 @@ def align_transcript(
                 and not fallback
                 and not short
                 and not repeated
+                and not ambiguous
                 and not insufficient
                 and not disagreement
                 and not force_context_unstable
+                and not timestamp_anomaly
+                and not coarse_timestamp
+                and not model_confidence_unavailable
+                and not low_model_confidence
+                and not guard_unavailable
                 and has_observed_paragraph
                 and has_local_refinement
                 and confidence >= auto_approve_threshold
             )
+            speech_start_sample = (
+                max(
+                    0,
+                    min(total_samples, round(asr_range.vad_start_ms * sample_rate / 1000)),
+                )
+                if asr_range is not None and asr_range.vad_start_ms is not None
+                else None
+            )
+            speech_end_sample = (
+                max(
+                    0,
+                    min(total_samples, round(asr_range.vad_end_ms * sample_rate / 1000)),
+                )
+                if asr_range is not None and asr_range.vad_end_ms is not None
+                else None
+            )
+            diagnostics: dict[str, object] = {
+                "timestamp_unit": "ms",
+                "matching_strategy": "anchored_monotonic_dp",
+                "source_highlight_index": int(
+                    _get(highlight, "source_highlight_index", default=highlight_index)
+                ),
+                "force_alignment": _range_diagnostics(force_range),
+                "asr_alignment": _range_diagnostics(asr_range),
+                "boundary_disagreement_ms": (
+                    round(boundary_difference, 3)
+                    if boundary_difference is not None
+                    else None
+                ),
+                "candidate_span_ms": round(candidate_span_ms, 3),
+                "alignment_ambiguity_margin": round(ambiguity_margin, 4),
+                "dp_forced_partition": dp_forced_partition,
+                "left_guard_sample": left_guard_sample,
+                "right_guard_sample": right_guard_sample,
+                "initial_start_sample": start_sample,
+                "initial_end_sample": end_sample,
+                "asr_track_diagnostics": (
+                    list(active_asr_track.diagnostics) if active_asr_track is not None else []
+                ),
+                "global_asr_track_diagnostics": (
+                    list(global_asr_track.diagnostics) if global_asr_track is not None else []
+                ),
+                "local_asr_track_diagnostics": (
+                    list(local_asr_track.diagnostics) if local_asr_track is not None else []
+                ),
+            }
             candidates.append(
                 AlignmentCandidate(
                     paragraph_index=paragraph_index,
@@ -1482,9 +2761,14 @@ def align_transcript(
                     proposed_start_sample=start_sample,
                     proposed_end_sample=end_sample,
                     confidence=confidence,
-                    reasons=reasons,
+                    reasons=list(dict.fromkeys(reasons)),
                     requires_review=not auto_approved,
                     status=STATUS_AUTO_APPROVED if auto_approved else STATUS_NEEDS_REVIEW,
+                    diagnostics=diagnostics,
+                    left_guard_sample=left_guard_sample,
+                    right_guard_sample=right_guard_sample,
+                    speech_start_sample=speech_start_sample,
+                    speech_end_sample=speech_end_sample,
                 )
             )
         if progress_cb is not None:
@@ -1493,24 +2777,37 @@ def align_transcript(
 
 
 __all__ = [
+    "ALIGNMENT_AMBIGUOUS",
     "ALIGNMENT_PIPELINE_NAME",
     "ALIGNMENT_PIPELINE_PURPOSE",
     "ALIGNMENT_PIPELINE_VERSION",
     "ASR_ALIGNER_UNAVAILABLE",
+    "BOUNDARY_EXPANDED",
+    "BOUNDARY_GUARD_UNAVAILABLE",
+    "BOUNDARY_REFINEMENT_UNCERTAIN",
     "BOUNDARY_DISAGREEMENT",
+    "COARSE_TIMESTAMP",
     "DOCUMENT_TIME_FALLBACK",
     "FALLBACK_ALIGNMENT",
     "FORCE_CONTEXT_UNSTABLE",
     "FORCE_ALIGNER_UNAVAILABLE",
     "INSUFFICIENT_COVERAGE",
     "LOCAL_RECOGNITION_UNAVAILABLE",
+    "LOW_MODEL_CONFIDENCE",
     "MAX_HIGHLIGHT_INTERNAL_GAP_MS",
+    "MODEL_CONFIDENCE_UNAVAILABLE",
     "REPEATED_CONTEXT",
     "SHORT_HIGHLIGHT",
     "STATUS_AUTO_APPROVED",
     "STATUS_NEEDS_REVIEW",
+    "TIMESTAMP_ANOMALY",
+    "TIMESTAMP_PRECISION_CHARACTER",
+    "TIMESTAMP_PRECISION_SEGMENT",
+    "TIMESTAMP_PRECISION_TOKEN",
+    "TIMESTAMP_PRECISION_UNKNOWN",
     "AlignmentCancelledError",
     "AlignmentCandidate",
+    "AlignmentRange",
     "AlignmentTrack",
     "RecognizedToken",
     "AsrAligner",
@@ -1524,4 +2821,5 @@ __all__ = [
     "normalize_text",
     "normalize_with_mapping",
     "recognition_tokens_from_model_result",
+    "voice_ranges_from_model_result",
 ]

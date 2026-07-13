@@ -21,17 +21,18 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-export MACOSX_DEPLOYMENT_TARGET=13.0
+export MACOSX_DEPLOYMENT_TARGET=15.0
 
-brew list python@3.11 >/dev/null 2>&1 || brew install python@3.11
-PYTHON311="$(brew --prefix python@3.11)/bin/python3.11"
+brew list uv >/dev/null 2>&1 || brew install uv
+uv python install 3.11
+PYTHON311="$(uv python find 3.11)"
 if [[ "$("$PYTHON311" -c 'import platform, sys; print(sys.version_info[:2] == (3, 11) and sys.version_info.releaselevel == "final" and platform.machine() == "arm64")')" != "True" ]]; then
   echo "A final Python 3.11 runtime is required." >&2
   exit 1
 fi
 
 if [[ ! -x .venv/bin/python ]]; then
-  "$PYTHON311" -m venv .venv
+  uv venv --python "$PYTHON311" .venv
 fi
 if [[ "$(.venv/bin/python -c 'import platform, sys; print(sys.version_info[:2] == (3, 11) and sys.version_info.releaselevel == "final" and platform.machine() == "arm64")')" != "True" ]]; then
   echo "Existing .venv is not native arm64 Python 3.11; remove it and run again." >&2
