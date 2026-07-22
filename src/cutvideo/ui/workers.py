@@ -8,8 +8,8 @@ import os
 import tempfile
 import threading
 from collections.abc import Callable
-from contextlib import nullcontext, suppress
-from dataclasses import dataclass, replace
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,9 +24,12 @@ from ..alignment import (
     SHORT_HIGHLIGHT,
     STATUS_NEEDS_REVIEW,
     AlignmentCandidate,
+    AsrAligner,
+    ForceAligner,
     FunASRAsrAligner,
     FunASRForceAligner,
     align_transcript,
+    alignment_track_from_recognition_tokens,
     normalize_with_mapping,
 )
 from ..audio import (
@@ -51,7 +54,11 @@ from ..ffmpeg import (
     export_audio,
     generate_preview,
 )
-from ..model_runtime import local_audio_window, model_execution_guard
+from ..model_runtime import ModelUnavailableError, model_execution_guard
+from ..progressive_asr import (
+    ProgressiveRecognitionChunk,
+    recognize_audio_progressively,
+)
 from ..project import (
     AudioInfo as ProjectAudioInfo,
 )
@@ -97,6 +104,18 @@ class TaskSignals(QObject):
     error = Signal(str)
     cancelled = Signal()
     finished = Signal()
+
+
+@dataclass(frozen=True, slots=True)
+class AsrTranscriptPartial:
+    """A real, newly committed ASR delta safe to display before finalization."""
+
+    delta_text: str
+    sequence: int
+    total_sequences: int
+    committed_until_ms: int
+    total_duration_ms: int
+    token_count: int
 
 
 class BackgroundTask(QRunnable):
@@ -154,6 +173,7 @@ class PreflightResult:
 class AnalysisResult:
     project: ProjectV1
     project_path: Path
+    recognized_text: str = ""
 
 
 @dataclass(slots=True)
@@ -239,6 +259,48 @@ def _manifest_model_info(
     return ModelInfo(purpose, name, revision, digest)
 
 
+def _runtime_aligners(
+    resources: RuntimeResources,
+    *,
+    ffmpeg_path: str | Path,
+) -> tuple[ForceAligner | None, AsrAligner | None]:
+    if resources.has_qwen_models:
+        from ..qwen_mlx import QwenMlxAsrAligner, QwenMlxForceAligner
+
+        assert resources.qwen_asr_model is not None
+        assert resources.qwen_force_model is not None
+        return (
+            QwenMlxForceAligner(
+                resources.qwen_force_model,
+                ffmpeg_path=ffmpeg_path,
+            ),
+            QwenMlxAsrAligner(
+                resources.qwen_asr_model,
+                ffmpeg_path=ffmpeg_path,
+            ),
+        )
+    force_aligner: ForceAligner | None = None
+    asr_aligner: AsrAligner | None = None
+    if resources.fa_model is not None:
+        force_aligner = FunASRForceAligner(
+            resources.fa_model,
+            ffmpeg_path=ffmpeg_path,
+        )
+    if resources.asr_model is not None and resources.vad_model is not None:
+        asr_aligner = FunASRAsrAligner(
+            resources.asr_model,
+            resources.vad_model,
+            ffmpeg_path=ffmpeg_path,
+        )
+    return force_aligner, asr_aligner
+
+
+def _release_model_adapter(adapter: object | None) -> None:
+    release = getattr(adapter, "release", None)
+    if callable(release):
+        release()
+
+
 def _uses_current_alignment_strategy(project: ProjectV1) -> bool:
     return any(
         model.purpose == ALIGNMENT_PIPELINE_PURPOSE
@@ -246,6 +308,33 @@ def _uses_current_alignment_strategy(project: ProjectV1) -> bool:
         and model.version == ALIGNMENT_PIPELINE_VERSION
         for model in project.models
     )
+
+
+def make_recognition_warmup_operation() -> Operation:
+    """Load and prime the shared ASR/VAD model during the first idle moment."""
+
+    def operation(token: CancelToken, report: ProgressReporter) -> bool:
+        token.raise_if_cancelled()
+        resources = discover_resources()
+        report(0.05, "正在后台预热连续识别模型…")
+        if resources.has_qwen_models and resources.qwen_asr_model is not None:
+            from ..qwen_mlx import QwenMlxAsrAligner
+
+            recognizer = QwenMlxAsrAligner(resources.qwen_asr_model)
+        elif resources.asr_model is not None and resources.vad_model is not None:
+            recognizer = FunASRAsrAligner(
+                resources.asr_model,
+                resources.vad_model,
+                ffmpeg_path=None,
+            )
+        else:
+            return False
+        recognizer.warmup()
+        token.raise_if_cancelled()
+        report(1.0, "连续识别模型已预热")
+        return True
+
+    return operation
 
 
 def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
@@ -322,14 +411,19 @@ def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
     return operation
 
 
-def make_analysis_operation(preflight: PreflightResult) -> Operation:
+def make_analysis_operation(
+    preflight: PreflightResult,
+    partial_cb: Callable[[AsrTranscriptPartial], None] | None = None,
+) -> Operation:
     def operation(token: CancelToken, report: ProgressReporter) -> AnalysisResult:
         token.raise_if_cancelled()
         _require_preflight_sources(preflight, "自动分析开始前")
         report(0.03, "正在准备本地对齐模型…")
         resources = preflight.resources
-        force_aligner = None
-        asr_aligner = None
+        force_aligner, asr_aligner = _runtime_aligners(
+            resources,
+            ffmpeg_path=preflight.tools.ffmpeg,
+        )
         models: list[ModelInfo] = [
             ModelInfo(
                 ALIGNMENT_PIPELINE_PURPOSE,
@@ -337,29 +431,35 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
                 ALIGNMENT_PIPELINE_VERSION,
             )
         ]
-        if resources.fa_model is not None:
-            force_aligner = FunASRForceAligner(
-                resources.fa_model,
-                ffmpeg_path=None,
-            )
-            models.append(_manifest_model_info(resources, "forced_alignment", "fa-zh"))
-        if resources.asr_model is not None and resources.vad_model is not None:
-            asr_aligner = FunASRAsrAligner(
-                resources.asr_model,
-                resources.vad_model,
-                ffmpeg_path=None,
-            )
+        if resources.has_qwen_models:
             models.append(
                 _manifest_model_info(
                     resources,
                     "primary_recognition_timeline",
-                    "paraformer-zh",
+                    "qwen3-asr-0.6b-4bit",
                 )
             )
             models.append(
-                _manifest_model_info(resources, "voice_activity_detection", "fsmn-vad")
+                _manifest_model_info(
+                    resources,
+                    "forced_alignment",
+                    "qwen3-forced-aligner-0.6b-4bit",
+                )
             )
-        report(0.06, "正在准备可复用的模型音频缓存…")
+        else:
+            if force_aligner is not None:
+                models.append(_manifest_model_info(resources, "forced_alignment", "fa-zh"))
+            if asr_aligner is not None:
+                models.append(
+                    _manifest_model_info(
+                        resources,
+                        "primary_recognition_timeline",
+                        "paraformer-zh",
+                    )
+                )
+                models.append(
+                    _manifest_model_info(resources, "voice_activity_detection", "fsmn-vad")
+                )
         duration_ms = max(
             1,
             math.ceil(
@@ -368,32 +468,95 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
                 / preflight.audio_info.sample_rate
             ),
         )
-        has_model = force_aligner is not None or asr_aligner is not None
-        model_audio_context = (
-            local_audio_window(
-                preflight.audio_info.path,
-                start_ms=0,
-                end_ms=duration_ms,
-                ffmpeg_path=preflight.tools.ffmpeg,
-                cancel=token,
+        global_asr_track = None
+        recognized_text = ""
+        progressive_chunk_count = 0
+        recognition_inference_device = "unavailable"
+        if asr_aligner is not None:
+            recognition_backend = resources.recognition_backend
+            recognition_model = (
+                resources.qwen_asr_model
+                if recognition_backend == "qwen-mlx"
+                else resources.asr_model
             )
-            if has_model
-            else nullcontext(preflight.audio_info.path)
-        )
-        with model_execution_guard(token), model_audio_context as model_audio_path:
-            model_audio_info = replace(preflight.audio_info, path=Path(model_audio_path))
-            report(0.10, "正在识别整段真实语音并匹配 Word 文字…")
-            alignments = align_transcript(
-                preflight.transcript,
-                model_audio_info,
-                force_aligner,
-                asr_aligner,
-                progress_cb=lambda done, total: report(
-                    0.10 + 0.60 * (done / max(1, total)),
-                    f"正在按真实语音定位段落 {done}/{total}…",
-                ),
-                cancel=token,
+            recognition_vad_model = (
+                None
+                if recognition_backend == "qwen-mlx"
+                else resources.vad_model
             )
+            assert recognition_model is not None
+            emitted_token_count = 0
+
+            def publish_chunk(chunk: ProgressiveRecognitionChunk) -> None:
+                nonlocal emitted_token_count
+                emitted_token_count += len(chunk.tokens)
+                if partial_cb is not None:
+                    partial_cb(
+                        AsrTranscriptPartial(
+                            "".join(item.text for item in chunk.tokens),
+                            chunk.sequence,
+                            chunk.total_sequences,
+                            chunk.committed_until_ms,
+                            chunk.duration_ms,
+                            emitted_token_count,
+                        )
+                    )
+
+            try:
+                progressive = recognize_audio_progressively(
+                    audio_path=preflight.audio_info.path,
+                    duration_ms=duration_ms,
+                    asr_model_path=recognition_model,
+                    vad_model_path=recognition_vad_model,
+                    ffmpeg_path=preflight.tools.ffmpeg,
+                    progress_cb=lambda value, message: report(
+                        0.08 + 0.38 * value,
+                        message,
+                    ),
+                    chunk_cb=publish_chunk,
+                    cancel=token,
+                    backend=recognition_backend,
+                )
+            except ModelUnavailableError:
+                token.raise_if_cancelled()
+                asr_aligner = None
+                report(0.46, "连续识别不可用，将生成全部需复核的安全估算…")
+            else:
+                recognized_text = "".join(item.text for item in progressive.tokens)
+                progressive_chunk_count = progressive.chunk_count
+                recognition_inference_device = progressive.inference_device
+                global_transcript = "\n".join(
+                    paragraph.text for paragraph in preflight.transcript.paragraphs
+                )
+                global_asr_track = alignment_track_from_recognition_tokens(
+                    progressive.tokens,
+                    global_transcript,
+                    engine=(
+                        "qwen3-asr-0.6b-mlx-progressive"
+                        if recognition_backend == "qwen-mlx"
+                        else "paraformer-zh+fsmn-vad-progressive"
+                    ),
+                    vad_ranges=progressive.voice_ranges,
+                )
+
+        try:
+            with model_execution_guard(token):
+                report(0.48, "正在用流式识别结果匹配 Word 文字…")
+                alignments = align_transcript(
+                    preflight.transcript,
+                    preflight.audio_info,
+                    force_aligner,
+                    asr_aligner,
+                    global_asr_track=global_asr_track,
+                    progress_cb=lambda done, total: report(
+                        0.48 + 0.22 * (done / max(1, total)),
+                        f"正在按真实语音定位段落 {done}/{total}…",
+                    ),
+                    cancel=token,
+                )
+        finally:
+            _release_model_adapter(force_aligner)
+            _release_model_adapter(asr_aligner)
         token.raise_if_cancelled()
 
         count = max(1, len(alignments))
@@ -416,13 +579,16 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
             )
             candidate.source_start_char = highlight.start
             candidate.source_end_char = highlight.end
-            # Storage remains conservative even if a future alignment adapter
-            # accidentally marks a one/two-character item as automatic.
-            if len(normalize_with_mapping(candidate.text).text) <= 2:
-                candidate.review_required = True
-                candidate.status = CandidateStatus.NEEDS_REVIEW
-                if SHORT_HIGHLIGHT not in candidate.reasons:
-                    candidate.reasons.append(SHORT_HIGHLIGHT)
+            # Every yellow Word highlight is a human decision.  Alignment
+            # confidence prioritises the queue and exposes risk, but must never
+            # silently turn a marked passage into an approved deletion.
+            candidate.review_required = True
+            candidate.status = CandidateStatus.NEEDS_REVIEW
+            if (
+                len(normalize_with_mapping(candidate.text).text) <= 2
+                and SHORT_HIGHLIGHT not in candidate.reasons
+            ):
+                candidate.reasons.append(SHORT_HIGHLIGHT)
             project_candidates.append(candidate)
 
         token.raise_if_cancelled()
@@ -447,6 +613,12 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
                     "version": ALIGNMENT_PIPELINE_VERSION,
                     "matching_strategy": "anchored_monotonic_dp",
                     "timestamp_unit": "ms",
+                    "recognition_delivery": "progressive_overlapping_windows",
+                    "recognition_chunk_count": progressive_chunk_count,
+                    "asr_inference_device": recognition_inference_device,
+                    "fa_inference_device": (
+                        force_aligner.device if force_aligner is not None else "unavailable"
+                    ),
                 },
                 "skipped_highlights": preflight.transcript.skipped_highlights,
                 "candidate_count": len(project_candidates),
@@ -464,7 +636,7 @@ def make_analysis_operation(preflight: PreflightResult) -> Operation:
         project_path = Path(preflight.audio_info.path).with_suffix(".cutvideo.json")
         save_project(project, project_path)
         report(1.0, "分析完成")
-        return AnalysisResult(project, project_path.resolve())
+        return AnalysisResult(project, project_path.resolve(), recognized_text)
 
     return operation
 
@@ -902,6 +1074,7 @@ def _commit_artifacts(pairs: tuple[tuple[Path, Path], ...]) -> None:
 
 __all__ = [
     "AnalysisResult",
+    "AsrTranscriptPartial",
     "BackgroundTask",
     "CancelToken",
     "CandidatePreviewResult",
@@ -914,6 +1087,7 @@ __all__ = [
     "make_load_project_operation",
     "make_preflight_operation",
     "make_preview_operation",
+    "make_recognition_warmup_operation",
     "make_relink_project_operation",
     "make_save_project_operation",
     "make_waveform_operation",

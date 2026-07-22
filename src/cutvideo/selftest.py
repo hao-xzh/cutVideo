@@ -60,16 +60,95 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
         _verify_preview_backend(report)
         return report
 
+    manifest = load_manifest(resources.root)
+    selftest_entry = manifest.get("selftest", {})
+    if not isinstance(selftest_entry, dict):
+        raise RuntimeError("self-test manifest entry is invalid")
+    audio_entry = selftest_entry.get("audio")
+    transcript_entry = selftest_entry.get("transcript")
+    if not isinstance(audio_entry, str) or not isinstance(transcript_entry, str):
+        raise RuntimeError("self-test audio/transcript is missing from manifest")
+    transcript = transcript_entry
+    bundled_audio = resources.root / audio_entry
+    if not bundled_audio.is_file():
+        raise RuntimeError(f"self-test audio is missing: {bundled_audio}")
+
+    if resources.has_qwen_models:
+        from .qwen_mlx import QwenMlxAsrAligner, QwenMlxForceAligner
+
+        assert resources.qwen_force_model is not None
+        assert resources.qwen_asr_model is not None
+        force_audio = bundled_audio
+        force_info = probe_audio(force_audio, tools=tools)
+        force_aligner = QwenMlxForceAligner(
+            resources.qwen_force_model,
+            ffmpeg_path=tools.ffmpeg,
+        )
+        try:
+            force_track = force_aligner.align(
+                audio_path=force_audio,
+                transcript=transcript,
+                window_start_ms=0,
+                window_end_ms=max(1, round(force_info.duration_seconds * 1000)),
+            )
+        finally:
+            force_aligner.release()
+        if not force_track.spans or not force_track.timestamp_valid:
+            raise RuntimeError("Qwen forced aligner returned no valid timestamp spans")
+
+        asr_audio = bundled_audio
+        asr_info = probe_audio(asr_audio, tools=tools)
+        recognizer = QwenMlxAsrAligner(
+            resources.qwen_asr_model,
+            ffmpeg_path=tools.ffmpeg,
+        )
+        try:
+            recognizer.preload()
+            asr_track = recognizer.align(
+                audio_path=asr_audio,
+                transcript=transcript,
+                window_start_ms=0,
+                window_end_ms=max(1, round(asr_info.duration_seconds * 1000)),
+            )
+            raw_tokens = recognizer.recognize(
+                audio_path=asr_audio,
+                window_start_ms=0,
+                window_end_ms=max(1, round(asr_info.duration_seconds * 1000)),
+            )
+        finally:
+            recognizer.release()
+        if not asr_track.spans:
+            raise RuntimeError("Qwen ASR alignment returned no timestamp spans")
+        if not raw_tokens:
+            raise RuntimeError("Qwen standalone transcription returned no timestamp tokens")
+        report.update(
+            {
+                "models_tested": True,
+                "recognition_backend": resources.recognition_backend,
+                "fa_model": "qwen3-forced-aligner-0.6b-4bit",
+                "fa_span_count": len(force_track.spans),
+                "fa_coverage": force_track.coverage,
+                "fa_inference_device": force_aligner.device,
+                "asr_model": "qwen3-asr-0.6b-4bit",
+                "asr_span_count": len(asr_track.spans),
+                "asr_coverage": asr_track.coverage,
+                "asr_inference_device": recognizer.device,
+                "raw_transcript_token_count": len(raw_tokens),
+            }
+        )
+        _verify_preview_backend(report)
+        return report
+
     assert resources.fa_model is not None
     assert resources.asr_model is not None
     assert resources.vad_model is not None
-    transcript = "欢迎大家来到魔搭社区进行体验"
     force_audio = resources.fa_model / "example" / "asr_example.wav"
     force_info = probe_audio(force_audio, tools=tools)
-    force_track = FunASRForceAligner(
+    force_aligner = FunASRForceAligner(
         resources.fa_model,
         ffmpeg_path=tools.ffmpeg,
-    ).align(
+    )
+    force_track = force_aligner.align(
         audio_path=force_audio,
         transcript=transcript,
         window_start_ms=0,
@@ -105,8 +184,10 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
             "models_tested": True,
             "fa_span_count": len(force_track.spans),
             "fa_coverage": force_track.coverage,
+            "fa_inference_device": force_aligner.device,
             "asr_span_count": len(asr_track.spans),
             "asr_coverage": asr_track.coverage,
+            "asr_inference_device": recognizer.device,
             "raw_transcript_token_count": len(raw_tokens),
         }
     )

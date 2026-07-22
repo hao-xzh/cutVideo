@@ -8,11 +8,13 @@ test doubles without introducing a storage-layer dependency.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import unicodedata
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -21,11 +23,17 @@ from pypinyin import Style, pinyin
 
 from .model_runtime import (
     ModelUnavailableError,
+    PreparedAudioWindowCache,
+    evict_funasr_model,
     load_funasr_model,
     local_audio_window,
     model_execution_guard,
+    model_inference_device,
     require_local_model,
+    resolve_inference_device,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 SHORT_HIGHLIGHT = "short_highlight"
 REPEATED_CONTEXT = "repeated_context"
@@ -50,7 +58,7 @@ BOUNDARY_REFINEMENT_UNCERTAIN = "boundary_refinement_evidence_incomplete"
 # are never silently reused after the audio-first pipeline changes.
 ALIGNMENT_PIPELINE_PURPOSE = "alignment_strategy"
 ALIGNMENT_PIPELINE_NAME = "audio-text-primary"
-ALIGNMENT_PIPELINE_VERSION = "6"
+ALIGNMENT_PIPELINE_VERSION = "9"
 
 # A highlighted phrase should be one locally continuous piece of speech.  A
 # larger hole usually means that sparse ASR matches from two different spoken
@@ -73,9 +81,11 @@ _PRECISION_RANK = {
 }
 _TIMESTAMP_EPSILON_MS = 5.0
 _MIN_TIMESTAMP_SPAN_MS = 5.0
+_MODEL_WINDOW_BOUNDARY_TOLERANCE_MS = 120.0
 _VAD_GAP_MS = 500.0
 _MIN_ALIGNMENT_MARGIN = 0.12
 _LOW_MODEL_CONFIDENCE_THRESHOLD = 0.50
+_SPOKEN_FILLER_CHARACTERS = frozenset({"呃", "嗯", "啊", "哦", "诶", "唉", "额"})
 
 
 class AlignmentCancelledError(RuntimeError):
@@ -227,6 +237,23 @@ def _character_match(
     return -1.15, 0.0
 
 
+def _reference_deletion_penalty(reference_text: str, index: int) -> float:
+    """Discount a duplicated manuscript character spoken only once."""
+
+    character = reference_text[index]
+    duplicated = (
+        (index > 0 and reference_text[index - 1] == character)
+        or (index + 1 < len(reference_text) and reference_text[index + 1] == character)
+    )
+    return 0.22 if duplicated else 0.75
+
+
+def _observed_insertion_penalty(observed_text: str, index: int) -> float:
+    """Treat common hesitation particles as normal spoken realization."""
+
+    return 0.18 if observed_text[index] in _SPOKEN_FILLER_CHARACTERS else 0.55
+
+
 def _reference_segment_indexes(transcript: str, normalized: NormalizedText) -> tuple[int, ...]:
     segment_at_original: list[int] = []
     segment = 0
@@ -345,9 +372,25 @@ def _dp_align_chunk(
     reference_length = len(reference_text)
     observed_length = len(observed_text)
     if not reference_length:
-        return _ChunkAlignment((), (), -0.55 * observed_length, None)
+        return _ChunkAlignment(
+            (),
+            (),
+            -sum(
+                _observed_insertion_penalty(observed_text, index)
+                for index in range(observed_length)
+            ),
+            None,
+        )
     if not observed_length:
-        return _ChunkAlignment((), (), -0.75 * reference_length, None)
+        return _ChunkAlignment(
+            (),
+            (),
+            -sum(
+                _reference_deletion_penalty(reference_text, index)
+                for index in range(reference_length)
+            ),
+            None,
+        )
 
     band = max(32, abs(reference_length - observed_length) + 24)
     estimated_cells = (reference_length + 1) * min(observed_length + 1, 2 * band + 3)
@@ -443,12 +486,26 @@ def _dp_align_chunk(
             if i:
                 for rank, previous in enumerate(cells.get((i - 1, j), ())):
                     possibilities.append(
-                        _DpEntry(previous.score - 0.75, i - 1, j, rank, "delete")
+                        _DpEntry(
+                            previous.score
+                            - _reference_deletion_penalty(reference_text, i - 1),
+                            i - 1,
+                            j,
+                            rank,
+                            "delete",
+                        )
                     )
             if j:
                 for rank, previous in enumerate(cells.get((i, j - 1), ())):
                     possibilities.append(
-                        _DpEntry(previous.score - 0.55, i, j - 1, rank, "insert")
+                        _DpEntry(
+                            previous.score
+                            - _observed_insertion_penalty(observed_text, j - 1),
+                            i,
+                            j - 1,
+                            rank,
+                            "insert",
+                        )
                     )
             possibilities.sort(key=lambda entry: entry.score, reverse=True)
             selected: list[_DpEntry] = []
@@ -997,14 +1054,15 @@ def _validated_timestamp_pairs(
         if (
             not math.isfinite(relative_start)
             or not math.isfinite(relative_end)
-            or relative_start < -_TIMESTAMP_EPSILON_MS
+            or relative_start < -_MODEL_WINDOW_BOUNDARY_TOLERANCE_MS
             or relative_end - relative_start < _MIN_TIMESTAMP_SPAN_MS
         ):
             diagnostics.append(f"timestamp_interval_invalid:{index}")
             continue
         if (
             maximum_relative is not None
-            and relative_end > maximum_relative + _TIMESTAMP_EPSILON_MS
+            and relative_end
+            > maximum_relative + _MODEL_WINDOW_BOUNDARY_TOLERANCE_MS
         ):
             diagnostics.append(f"timestamp_outside_window:{index}")
             continue
@@ -1313,6 +1371,82 @@ def _observed_characters(
     return observed, tuple(dict.fromkeys(diagnostics)), not diagnostics, vad_ranges
 
 
+def _alignment_track_from_observed(
+    observed: Sequence[_ObservedCharacter],
+    transcript: str,
+    *,
+    engine: str,
+    forced_reference: bool,
+    timestamp_diagnostics: Sequence[str],
+    timestamp_valid: bool,
+    vad_ranges: Sequence[tuple[float, float]],
+    timestamp_unit: str,
+) -> AlignmentTrack:
+    reference = normalize_with_mapping(transcript)
+    if not reference.text:
+        return AlignmentTrack((), engine, 0.0)
+    observed_text = "".join(character.text for character in observed)
+    alignment = _monotonic_character_alignment(
+        reference.text,
+        observed_text,
+        allow_phonetic_fallback=not forced_reference,
+        reference_segments=_reference_segment_indexes(transcript, reference),
+        observed_segments=tuple(character.segment_index for character in observed),
+    )
+    spans: list[TimedSpan] = []
+    covered: set[int] = set()
+    for normalized_index, observed_index, confidence in alignment.pairs:
+        character = observed[observed_index]
+        spans.append(
+            TimedSpan(
+                normalized_index,
+                normalized_index + 1,
+                character.start_ms,
+                character.end_ms,
+                confidence,
+                character.model_confidence,
+                character.timestamp_precision,
+                alignment.margins.get(normalized_index, 1.0),
+            )
+        )
+        covered.add(normalized_index)
+    spans.sort(key=lambda span: (span.normalized_start, span.start_ms))
+    model_confidences = [
+        span.model_confidence for span in spans if span.model_confidence is not None
+    ]
+    precision = max(
+        (span.timestamp_precision for span in spans),
+        key=lambda value: _PRECISION_RANK[value],
+        default=TIMESTAMP_PRECISION_UNKNOWN,
+    )
+    diagnostics = list(timestamp_diagnostics)
+    diagnostics.append(f"timestamp_unit:{timestamp_unit}")
+    diagnostics.append("matching_strategy:anchored_monotonic_dp")
+    if alignment.forced_partition:
+        diagnostics.append("dp_forced_partition")
+    if not vad_ranges and not forced_reference:
+        diagnostics.append("vad_ranges_unavailable")
+    return AlignmentTrack(
+        tuple(spans),
+        engine,
+        len(covered) / len(reference.text),
+        sum(model_confidences) / len(model_confidences) if model_confidences else None,
+        min(model_confidences) if model_confidences else None,
+        (
+            sum(value < _LOW_MODEL_CONFIDENCE_THRESHOLD for value in model_confidences)
+            / len(model_confidences)
+            if model_confidences
+            else None
+        ),
+        precision,
+        timestamp_valid,
+        alignment.ambiguity_margin,
+        tuple(dict.fromkeys(diagnostics)),
+        vad_ranges,
+        len(model_confidences) / len(spans) if spans else 0.0,
+    )
+
+
 def alignment_track_from_model_result(
     result: object,
     transcript: str,
@@ -1352,67 +1486,73 @@ def alignment_track_from_model_result(
         forced_reference=forced_reference,
         window_end_ms=window_end_ms,
     )
-    observed_text = "".join(character.text for character in observed)
-    alignment = _monotonic_character_alignment(
-        reference.text,
-        observed_text,
-        allow_phonetic_fallback=not forced_reference,
-        reference_segments=_reference_segment_indexes(transcript, reference),
-        observed_segments=tuple(character.segment_index for character in observed),
+    return _alignment_track_from_observed(
+        observed,
+        transcript,
+        engine=engine,
+        forced_reference=forced_reference,
+        timestamp_diagnostics=timestamp_diagnostics,
+        timestamp_valid=timestamp_valid,
+        vad_ranges=vad_ranges,
+        timestamp_unit="seconds" if timestamps_in_seconds else "milliseconds",
     )
-    spans: list[TimedSpan] = []
-    covered: set[int] = set()
-    for normalized_index, observed_index, confidence in alignment.pairs:
-        character = observed[observed_index]
-        spans.append(
-            TimedSpan(
-                normalized_index,
-                normalized_index + 1,
-                character.start_ms,
-                character.end_ms,
-                confidence,
-                character.model_confidence,
-                character.timestamp_precision,
-                alignment.margins.get(normalized_index, 1.0),
+
+
+def alignment_track_from_recognition_tokens(
+    tokens: Sequence[RecognizedToken],
+    transcript: str,
+    *,
+    engine: str,
+    vad_ranges: Sequence[tuple[float, float]] = (),
+) -> AlignmentTrack:
+    """Map an already streamed token timeline onto one reference transcript."""
+
+    observed: list[_ObservedCharacter] = []
+    fallback_segment = 0
+    previous_end: float | None = None
+    normalized_ranges = tuple(
+        sorted(
+            (float(start_ms), float(end_ms))
+            for start_ms, end_ms in vad_ranges
+            if math.isfinite(start_ms)
+            and math.isfinite(end_ms)
+            and start_ms >= 0
+            and end_ms > start_ms
+        )
+    )
+    for token in tokens:
+        if previous_end is not None and token.start_ms - previous_end >= _VAD_GAP_MS:
+            fallback_segment += 1
+        segment_index = _segment_index_for_interval(
+            token.start_ms,
+            token.end_ms,
+            normalized_ranges,
+            fallback_segment,
+        )
+        observed.extend(
+            _expand_timed_unit(
+                token.text,
+                token.start_ms,
+                token.end_ms,
+                model_confidence=(
+                    token.confidence if token.confidence_available else None
+                ),
+                timestamp_precision=token.timestamp_precision,
+                segment_index=segment_index,
             )
         )
-        covered.add(normalized_index)
-    spans.sort(key=lambda span: (span.normalized_start, span.start_ms))
-    model_confidences = [
-        span.model_confidence for span in spans if span.model_confidence is not None
-    ]
-    precision = max(
-        (span.timestamp_precision for span in spans),
-        key=lambda value: _PRECISION_RANK[value],
-        default=TIMESTAMP_PRECISION_UNKNOWN,
-    )
-    diagnostics = list(timestamp_diagnostics)
-    diagnostics.append(
-        f"timestamp_unit:{'seconds' if timestamps_in_seconds else 'milliseconds'}"
-    )
-    diagnostics.append("matching_strategy:anchored_monotonic_dp")
-    if alignment.forced_partition:
-        diagnostics.append("dp_forced_partition")
-    if not vad_ranges and not forced_reference:
-        diagnostics.append("vad_ranges_unavailable")
-    return AlignmentTrack(
-        tuple(spans),
-        engine,
-        len(covered) / len(reference.text),
-        sum(model_confidences) / len(model_confidences) if model_confidences else None,
-        min(model_confidences) if model_confidences else None,
-        (
-            sum(value < _LOW_MODEL_CONFIDENCE_THRESHOLD for value in model_confidences)
-            / len(model_confidences)
-            if model_confidences
-            else None
-        ),
-        precision,
-        timestamp_valid,
-        alignment.ambiguity_margin,
-        tuple(dict.fromkeys(diagnostics)),
-        vad_ranges,
-        len(model_confidences) / len(spans) if spans else 0.0,
+        previous_end = (
+            token.end_ms if previous_end is None else max(previous_end, token.end_ms)
+        )
+    return _alignment_track_from_observed(
+        observed,
+        transcript,
+        engine=engine,
+        forced_reference=False,
+        timestamp_diagnostics=(),
+        timestamp_valid=True,
+        vad_ranges=normalized_ranges,
+        timestamp_unit="milliseconds",
     )
 
 
@@ -1443,8 +1583,255 @@ def recognition_tokens_from_model_result(
         )
         for character in observed
     ]
-    tokens.sort(key=lambda token: (token.start_ms, token.end_ms))
+    # Preserve the model's transcript order.  Adjacent FunASR VAD slices may
+    # overlap by a few milliseconds; sorting those characters by timestamp can
+    # silently swap the spoken text at a slice boundary.  The standalone audio
+    # workspace normalizes the small overlap while keeping this semantic order.
     return tuple(tokens)
+
+
+def _refinement_groups(
+    tokens: Sequence[RecognizedToken],
+    *,
+    gap_ms: float,
+    max_window_span_ms: float,
+) -> list[tuple[int, int]]:
+    """Split tokens into locally continuous speech chunks for re-alignment."""
+
+    groups: list[tuple[int, int]] = []
+    group_start = 0
+    group_first_start = tokens[0].start_ms
+    previous_end = tokens[0].end_ms
+    for index in range(1, len(tokens)):
+        token = tokens[index]
+        if (
+            token.start_ms - previous_end >= gap_ms
+            or token.end_ms - group_first_start > max_window_span_ms
+        ):
+            groups.append((group_start, index))
+            group_start = index
+            group_first_start = token.start_ms
+        previous_end = max(previous_end, token.end_ms)
+    groups.append((group_start, len(tokens)))
+    return groups
+
+
+def _group_already_character_precise(group: Sequence[RecognizedToken]) -> bool:
+    """Return True when every token already has a distinct character interval."""
+
+    if not group:
+        return True
+    if any(token.timestamp_precision != TIMESTAMP_PRECISION_CHARACTER for token in group):
+        return False
+    if len(group) < 2:
+        return True
+    # Shared identical intervals mean the character label is lying about
+    # granularity, so a forced-alignment pass is still worthwhile.
+    first = group[0]
+    return not all(
+        math.isclose(token.start_ms, first.start_ms)
+        and math.isclose(token.end_ms, first.end_ms)
+        for token in group[1:]
+    )
+
+
+def refine_recognition_tokens(
+    tokens: Sequence[RecognizedToken],
+    *,
+    force_aligner: ForceAligner,
+    audio_path: str | Path,
+    audio_end_ms: float,
+    window_padding_ms: int = 200,
+    max_window_span_ms: float = 30_000.0,
+    max_boundary_shift_ms: float = 350.0,
+    minimum_coverage: float = 0.80,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel: object | None = None,
+) -> tuple[tuple[RecognizedToken, ...], dict[str, object]]:
+    """Sharpen shared word/segment intervals into per-character timestamps.
+
+    A recognizer may emit only a coarse interval for a whole local sentence;
+    every contained character then shares that interval, which makes a
+    mid-token selection look badly misplaced.  This pass re-runs the selected
+    local forced-alignment backend on each continuous speech chunk with the
+    recognized text itself as the reference, yielding per-character boundaries
+    without inventing any text.  A
+    refined boundary is accepted only when the chunk was well covered, the new
+    interval stays near the original one, and token order stays monotonic.
+    """
+
+    refinement_engine = (
+        "qwen3-asr-mlx-forced-character-refinement"
+        if type(force_aligner).__name__ == "QwenMlxForceAligner"
+        else "fa-zh-character-refinement"
+    )
+    if not tokens:
+        return (), {"engine": refinement_engine, "group_count": 0}
+    if window_padding_ms < 0 or not math.isfinite(audio_end_ms) or audio_end_ms <= 0:
+        raise ValueError("invalid refinement window parameters")
+    if not math.isfinite(max_boundary_shift_ms) or max_boundary_shift_ms < 0:
+        raise ValueError("max_boundary_shift_ms must be non-negative and finite")
+    if not math.isfinite(minimum_coverage) or not 0.0 <= minimum_coverage <= 1.0:
+        raise ValueError("minimum_coverage must be between zero and one")
+    groups = _refinement_groups(
+        tokens,
+        gap_ms=_VAD_GAP_MS,
+        max_window_span_ms=max_window_span_ms,
+    )
+    refined: list[RecognizedToken] = list(tokens)
+    refined_token_count = 0
+    refined_group_count = 0
+    failed_group_count = 0
+    previous_start = -math.inf
+    previous_end = -math.inf
+
+    def accept(index: int, start_ms: float, end_ms: float, precision: str) -> bool:
+        nonlocal previous_start, previous_end, refined_token_count
+        original = tokens[index]
+        if (
+            end_ms <= start_ms
+            or start_ms < original.start_ms - max_boundary_shift_ms
+            or end_ms > original.end_ms + max_boundary_shift_ms
+            or start_ms + _TIMESTAMP_EPSILON_MS < previous_start
+            or end_ms + _TIMESTAMP_EPSILON_MS < previous_end
+        ):
+            return False
+        refined[index] = RecognizedToken(
+            original.text,
+            start_ms,
+            end_ms,
+            original.confidence,
+            original.confidence_available,
+            precision,
+        )
+        previous_start = max(previous_start, start_ms)
+        previous_end = max(previous_end, end_ms)
+        refined_token_count += 1
+        return True
+
+    if progress_cb is not None:
+        progress_cb(0, len(groups))
+    skipped_precise_group_count = 0
+    ffmpeg_path = getattr(force_aligner, "ffmpeg_path", None)
+    stack = ExitStack()
+    window_cache: PreparedAudioWindowCache | None = None
+    if Path(audio_path).expanduser().is_file():
+        window_cache = stack.enter_context(
+            PreparedAudioWindowCache(
+                audio_path,
+                ffmpeg_path=ffmpeg_path,
+                cancel=cancel,
+            )
+        )
+    try:
+      for group_index, (left, right) in enumerate(groups):
+        if _is_cancelled(cancel):
+            raise AlignmentCancelledError("token refinement was cancelled")
+        group = tokens[left:right]
+        offsets: list[int] = []
+        lengths: list[int] = []
+        base = 0
+        for token in group:
+            length = len(normalize_with_mapping(token.text).text)
+            offsets.append(base)
+            lengths.append(length)
+            base += length
+        keep_group_originals = True
+        if base > 0 and _group_already_character_precise(group):
+            # paraformer sometimes already emits true per-character intervals.
+            # Re-running fa-zh on those chunks only burns CPU.
+            skipped_precise_group_count += 1
+            previous_start = max(previous_start, *(token.start_ms for token in group))
+            previous_end = max(previous_end, *(token.end_ms for token in group))
+            if progress_cb is not None:
+                progress_cb(group_index + 1, len(groups))
+            continue
+        if base > 0:
+            window_start = max(0, int(min(token.start_ms for token in group)) - window_padding_ms)
+            window_end = min(
+                int(math.ceil(audio_end_ms)),
+                int(math.ceil(max(token.end_ms for token in group))) + window_padding_ms,
+            )
+            track = (
+                _invoke_aligner(
+                    force_aligner,
+                    engine=refinement_engine,
+                    audio_path=audio_path,
+                    transcript="".join(token.text for token in group),
+                    window_start_ms=window_start,
+                    window_end_ms=window_end,
+                    reference_length=base,
+                    window_cache=window_cache,
+                )
+                if window_end > window_start
+                else None
+            )
+            if (
+                track is not None
+                and track.timestamp_valid
+                and track.coverage >= minimum_coverage
+            ):
+                spans_by_index: dict[int, TimedSpan] = {}
+                for span in track.spans:
+                    for index in range(span.normalized_start, span.normalized_end):
+                        spans_by_index.setdefault(index, span)
+                keep_group_originals = False
+                refined_group_count += 1
+                for token_offset, token in enumerate(group):
+                    index = left + token_offset
+                    covering = [
+                        spans_by_index[position]
+                        for position in range(
+                            offsets[token_offset],
+                            offsets[token_offset] + lengths[token_offset],
+                        )
+                        if position in spans_by_index
+                    ]
+                    accepted = False
+                    if len(covering) == lengths[token_offset] and covering:
+                        precision = (
+                            TIMESTAMP_PRECISION_CHARACTER
+                            if lengths[token_offset] == 1
+                            and all(
+                                span.timestamp_precision == TIMESTAMP_PRECISION_CHARACTER
+                                for span in covering
+                            )
+                            else max(
+                                (span.timestamp_precision for span in covering),
+                                key=lambda value: _PRECISION_RANK[value],
+                            )
+                        )
+                        accepted = accept(
+                            index,
+                            min(span.start_ms for span in covering),
+                            max(span.end_ms for span in covering),
+                            precision,
+                        )
+                    if not accepted:
+                        previous_start = max(previous_start, token.start_ms)
+                        previous_end = max(previous_end, token.end_ms)
+            else:
+                failed_group_count += 1
+        if keep_group_originals:
+            previous_start = max(previous_start, *(token.start_ms for token in group))
+            previous_end = max(previous_end, *(token.end_ms for token in group))
+        if progress_cb is not None:
+            progress_cb(group_index + 1, len(groups))
+    finally:
+        stack.close()
+    diagnostics: dict[str, object] = {
+        "engine": refinement_engine,
+        "group_count": len(groups),
+        "refined_group_count": refined_group_count,
+        "failed_group_count": failed_group_count,
+        "skipped_precise_group_count": skipped_precise_group_count,
+        "refined_token_count": refined_token_count,
+        "unchanged_token_count": len(tokens) - refined_token_count,
+        "window_padding_ms": window_padding_ms,
+        "max_boundary_shift_ms": max_boundary_shift_ms,
+        "minimum_coverage": minimum_coverage,
+    }
+    return tuple(refined), diagnostics
 
 
 class FunASRForceAligner:
@@ -1455,26 +1842,46 @@ class FunASRForceAligner:
         model_path: str | Path,
         *,
         ffmpeg_path: str | Path | None = None,
-        device: str = "cpu",
+        device: str | None = None,
         model_factory: Any | None = None,
         timestamps_in_seconds: bool = False,
     ) -> None:
         self.model_path = require_local_model(model_path, "fa-zh")
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path is not None else None
-        self.device = device
+        self.device = resolve_inference_device(device)
         self.model_factory = model_factory
         self.timestamps_in_seconds = timestamps_in_seconds
         self._model: Any | None = None
 
     def _get_model(self) -> Any:
         if self._model is None:
-            self._model = load_funasr_model(
+            model = load_funasr_model(
                 model_path=self.model_path,
                 label="fa-zh",
                 device=self.device,
                 model_factory=self.model_factory,
             )
+            self.device = model_inference_device(model, self.device)
+            self._model = model
         return self._model
+
+    def _generate(self, **kwargs: Any) -> object:
+        try:
+            with model_execution_guard():
+                return self._get_model().generate(**kwargs)
+        except Exception as accelerator_error:
+            if self.model_factory is not None or not self.device.casefold().startswith("mps"):
+                raise
+            _LOGGER.warning(
+                "fa-zh MPS inference failed; retrying this session on CPU: %s",
+                accelerator_error,
+            )
+            if self._model is not None:
+                evict_funasr_model(self._model)
+            self.device = "cpu"
+            self._model = None
+            with model_execution_guard():
+                return self._get_model().generate(**kwargs)
 
     def align(
         self,
@@ -1490,21 +1897,39 @@ class FunASRForceAligner:
             end_ms=window_end_ms,
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
-            try:
-                with model_execution_guard():
-                    result = self._get_model().generate(
-                        input=(str(window), transcript),
-                        data_type=("sound", "text"),
-                        disable_pbar=True,
-                        disable_log=True,
-                    )
-            except Exception as exc:
-                raise ModelUnavailableError(f"fa-zh 本地推理失败: {exc}") from exc
+            return self.align_prepared(
+                audio_path=window,
+                transcript=transcript,
+                time_offset_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+
+    def align_prepared(
+        self,
+        *,
+        audio_path: str | Path,
+        transcript: str,
+        time_offset_ms: int,
+        window_end_ms: int,
+    ) -> AlignmentTrack:
+        """Force-align against an already materialized local audio window."""
+
+        prepared = Path(audio_path).expanduser()
+        prepared_path = prepared.resolve() if prepared.exists() else prepared
+        try:
+            result = self._generate(
+                input=(str(prepared_path), transcript),
+                data_type=("sound", "text"),
+                disable_pbar=True,
+                disable_log=True,
+            )
+        except Exception as exc:
+            raise ModelUnavailableError(f"fa-zh 本地推理失败: {exc}") from exc
         return alignment_track_from_model_result(
             result,
             transcript,
             engine="fa-zh",
-            time_offset_ms=window_start_ms,
+            time_offset_ms=time_offset_ms,
             timestamps_in_seconds=self.timestamps_in_seconds,
             forced_reference=True,
             window_end_ms=window_end_ms,
@@ -1520,7 +1945,7 @@ class FunASRAsrAligner:
         vad_model_path: str | Path,
         *,
         ffmpeg_path: str | Path | None = None,
-        device: str = "cpu",
+        device: str | None = None,
         model_factory: Any | None = None,
         timestamps_in_seconds: bool = False,
         max_vad_segment_ms: int = 30_000,
@@ -1528,7 +1953,7 @@ class FunASRAsrAligner:
         self.model_path = require_local_model(model_path, "paraformer-zh")
         self.vad_model_path = require_local_model(vad_model_path, "fsmn-vad")
         self.ffmpeg_path = Path(ffmpeg_path).resolve() if ffmpeg_path is not None else None
-        self.device = device
+        self.device = resolve_inference_device(device)
         self.model_factory = model_factory
         self.timestamps_in_seconds = timestamps_in_seconds
         self.max_vad_segment_ms = max(1_000, int(max_vad_segment_ms))
@@ -1536,7 +1961,7 @@ class FunASRAsrAligner:
 
     def _get_model(self) -> Any:
         if self._model is None:
-            self._model = load_funasr_model(
+            model = load_funasr_model(
                 model_path=self.model_path,
                 vad_model_path=self.vad_model_path,
                 label="paraformer-zh",
@@ -1552,7 +1977,48 @@ class FunASRAsrAligner:
                     }
                 },
             )
+            self.device = model_inference_device(model, self.device)
+            self._model = model
         return self._model
+
+    def _generate(self, **kwargs: Any) -> object:
+        try:
+            with model_execution_guard():
+                return self._get_model().generate(**kwargs)
+        except Exception as accelerator_error:
+            if self.model_factory is not None or not self.device.casefold().startswith("mps"):
+                raise
+            _LOGGER.warning(
+                "paraformer-zh MPS inference failed; retrying this session on CPU: %s",
+                accelerator_error,
+            )
+            if self._model is not None:
+                evict_funasr_model(self._model)
+            self.device = "cpu"
+            self._model = None
+            with model_execution_guard():
+                return self._get_model().generate(**kwargs)
+
+    def preload(self) -> None:
+        """Load the local ASR/VAD pair without running an inference."""
+
+        self._get_model()
+
+    def warmup(self) -> None:
+        """Load the model and compile its first real inference path while idle."""
+
+        self.preload()
+        example = self.model_path / "example" / "asr_example.wav"
+        if not example.is_file():
+            return
+        self._generate(
+            input=str(example),
+            batch_size_s=300,
+            use_itn=False,
+            pred_timestamp=True,
+            disable_pbar=True,
+            disable_log=True,
+        )
 
     def align(
         self,
@@ -1568,23 +2034,41 @@ class FunASRAsrAligner:
             end_ms=window_end_ms,
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
-            try:
-                with model_execution_guard():
-                    result = self._get_model().generate(
-                        input=str(window),
-                        batch_size_s=300,
-                        use_itn=False,
-                        pred_timestamp=True,
-                        disable_pbar=True,
-                        disable_log=True,
-                    )
-            except Exception as exc:
-                raise ModelUnavailableError(f"paraformer-zh 本地推理失败: {exc}") from exc
+            return self.align_prepared(
+                audio_path=window,
+                transcript=transcript,
+                time_offset_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+
+    def align_prepared(
+        self,
+        *,
+        audio_path: str | Path,
+        transcript: str,
+        time_offset_ms: int,
+        window_end_ms: int,
+    ) -> AlignmentTrack:
+        """Map timestamps from an already materialized local audio window."""
+
+        prepared = Path(audio_path).expanduser()
+        prepared_path = prepared.resolve() if prepared.exists() else prepared
+        try:
+            result = self._generate(
+                input=str(prepared_path),
+                batch_size_s=300,
+                use_itn=False,
+                pred_timestamp=True,
+                disable_pbar=True,
+                disable_log=True,
+            )
+        except Exception as exc:
+            raise ModelUnavailableError(f"paraformer-zh 本地推理失败: {exc}") from exc
         return alignment_track_from_model_result(
             result,
             transcript,
             engine="paraformer-zh+fsmn-vad",
-            time_offset_ms=window_start_ms,
+            time_offset_ms=time_offset_ms,
             timestamps_in_seconds=self.timestamps_in_seconds,
             window_end_ms=window_end_ms,
         )
@@ -1620,22 +2104,43 @@ class FunASRAsrAligner:
             end_ms=window_end_ms,
             ffmpeg_path=self.ffmpeg_path,
         ) as window:
-            try:
-                with model_execution_guard():
-                    result = self._get_model().generate(
-                        input=str(window),
-                        batch_size_s=300,
-                        use_itn=False,
-                        pred_timestamp=True,
-                        disable_pbar=True,
-                        disable_log=True,
-                    )
-            except Exception as exc:
-                raise ModelUnavailableError(f"paraformer-zh 本地转写失败: {exc}") from exc
+            return self.recognize_prepared_with_result(
+                audio_path=window,
+                time_offset_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+
+    def recognize_prepared_with_result(
+        self,
+        *,
+        audio_path: str | Path,
+        time_offset_ms: int,
+        window_end_ms: int,
+    ) -> tuple[tuple[RecognizedToken, ...], object]:
+        """Recognize an already materialized local audio window.
+
+        Progressive ASR has already decoded its bounded MP3/M4A window to a
+        temporary WAV.  Accepting that exact file avoids copying the same PCM
+        into a second temporary directory before every inference.
+        """
+
+        prepared = Path(audio_path).expanduser()
+        prepared_path = prepared.resolve() if prepared.exists() else prepared
+        try:
+            result = self._generate(
+                input=str(prepared_path),
+                batch_size_s=300,
+                use_itn=False,
+                pred_timestamp=True,
+                disable_pbar=True,
+                disable_log=True,
+            )
+        except Exception as exc:
+            raise ModelUnavailableError(f"paraformer-zh 本地转写失败: {exc}") from exc
         return (
             recognition_tokens_from_model_result(
                 result,
-                time_offset_ms=window_start_ms,
+                time_offset_ms=time_offset_ms,
                 timestamps_in_seconds=self.timestamps_in_seconds,
                 window_end_ms=window_end_ms,
             ),
@@ -1737,16 +2242,26 @@ def _invoke_aligner(
     window_start_ms: int,
     window_end_ms: int,
     reference_length: int,
+    window_cache: PreparedAudioWindowCache | None = None,
 ) -> AlignmentTrack | None:
     if aligner is None:
         return None
     try:
-        result = aligner.align(
-            audio_path=audio_path,
-            transcript=transcript,
-            window_start_ms=window_start_ms,
-            window_end_ms=window_end_ms,
-        )
+        if window_cache is not None and hasattr(aligner, "align_prepared"):
+            prepared = window_cache.get(window_start_ms, window_end_ms)
+            result = aligner.align_prepared(
+                audio_path=prepared,
+                transcript=transcript,
+                time_offset_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+        else:
+            result = aligner.align(
+                audio_path=audio_path,
+                transcript=transcript,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
         return _coerce_track(result, engine, reference_length)
     except ModelUnavailableError:
         # One corrupt paragraph or missing optional runtime must never result in
@@ -2050,6 +2565,7 @@ def align_transcript(
     minimum_force_coverage: float = 0.80,
     minimum_asr_coverage: float = 0.65,
     auto_approve_threshold: float = 0.82,
+    global_asr_track: AlignmentTrack | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel: object | None = None,
 ) -> list[AlignmentCandidate]:
@@ -2100,7 +2616,6 @@ def align_transcript(
     if not isinstance(paragraphs_value, Sequence) or isinstance(paragraphs_value, (str, bytes)):
         raise TypeError("parsed transcript must contain a paragraph sequence")
     paragraphs = list(paragraphs_value)
-    candidates: list[AlignmentCandidate] = []
 
     # Joining with newlines keeps paragraph boundaries readable for model
     # diagnostics while normalization removes those separators.  The bases
@@ -2118,15 +2633,94 @@ def align_transcript(
     # This is the decisive search step: actual recognized audio across the
     # full decoded PCM duration.  No Word anchor is involved in this call.
     audio_end_ms = max(1, (total_samples * 1000 + sample_rate - 1) // sample_rate)
-    global_asr_track = _invoke_aligner(
-        asr_aligner,
-        engine="paraformer-zh+fsmn-vad-global",
-        audio_path=audio_path,
-        transcript=global_transcript,
-        window_start_ms=0,
-        window_end_ms=audio_end_ms,
-        reference_length=normalized_total,
+    ffmpeg_path = next(
+        (
+            path
+            for aligner in (force_aligner, asr_aligner)
+            if (path := getattr(aligner, "ffmpeg_path", None)) is not None
+        ),
+        None,
     )
+    stack = ExitStack()
+    window_cache: PreparedAudioWindowCache | None = None
+    if str(audio_path) and Path(str(audio_path)).expanduser().is_file():
+        window_cache = stack.enter_context(
+            PreparedAudioWindowCache(
+                audio_path,
+                ffmpeg_path=ffmpeg_path,
+                cancel=cancel,
+            )
+        )
+    try:
+        return _align_transcript_with_window_cache(
+            paragraphs=paragraphs,
+            paragraph_texts=paragraph_texts,
+            normalized_paragraphs=normalized_paragraphs,
+            paragraph_bases=paragraph_bases,
+            global_transcript=global_transcript,
+            global_normalized_text=global_normalized_text,
+            normalized_total=normalized_total,
+            audio_path=audio_path,
+            audio_end_ms=audio_end_ms,
+            duration_ms=duration_ms,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+            force_aligner=force_aligner,
+            asr_aligner=asr_aligner,
+            global_asr_track=global_asr_track,
+            window_padding_ms=window_padding_ms,
+            local_recognition_padding_ms=local_recognition_padding_ms,
+            boundary_tolerance_ms=boundary_tolerance_ms,
+            minimum_force_coverage=minimum_force_coverage,
+            minimum_asr_coverage=minimum_asr_coverage,
+            auto_approve_threshold=auto_approve_threshold,
+            progress_cb=progress_cb,
+            cancel=cancel,
+            window_cache=window_cache,
+        )
+    finally:
+        stack.close()
+
+
+def _align_transcript_with_window_cache(
+    *,
+    paragraphs: list[object],
+    paragraph_texts: list[str],
+    normalized_paragraphs: list[NormalizedText],
+    paragraph_bases: list[int],
+    global_transcript: str,
+    global_normalized_text: str,
+    normalized_total: int,
+    audio_path: object,
+    audio_end_ms: int,
+    duration_ms: float,
+    sample_rate: int,
+    total_samples: int,
+    force_aligner: ForceAligner | None,
+    asr_aligner: AsrAligner | None,
+    global_asr_track: AlignmentTrack | None,
+    window_padding_ms: int,
+    local_recognition_padding_ms: int,
+    boundary_tolerance_ms: float,
+    minimum_force_coverage: float,
+    minimum_asr_coverage: float,
+    auto_approve_threshold: float,
+    progress_cb: Callable[[int, int], None] | None,
+    cancel: object | None,
+    window_cache: PreparedAudioWindowCache | None,
+) -> list[AlignmentCandidate]:
+    candidates: list[AlignmentCandidate] = []
+    if global_asr_track is None:
+        global_asr_track = _invoke_aligner(
+            asr_aligner,
+            engine="paraformer-zh+fsmn-vad-global",
+            audio_path=audio_path,
+            transcript=global_transcript,
+            window_start_ms=0,
+            window_end_ms=audio_end_ms,
+            reference_length=normalized_total,
+            window_cache=window_cache,
+        )
     total_paragraphs = len(paragraphs)
     if progress_cb is not None:
         progress_cb(0, total_paragraphs)
@@ -2195,6 +2789,7 @@ def align_transcript(
                 window_start_ms=window_start_ms,
                 window_end_ms=window_end_ms,
                 reference_length=len(normalized.text),
+                window_cache=window_cache,
             )
         # When the global audio text cannot locate a paragraph at all, retain
         # one anchor-window ASR attempt strictly as a review-only fallback.
@@ -2208,6 +2803,7 @@ def align_transcript(
                 window_start_ms=window_start_ms,
                 window_end_ms=window_end_ms,
                 reference_length=len(normalized.text),
+                window_cache=window_cache,
             )
 
         for highlight_index, highlight in enumerate(highlights):
@@ -2287,6 +2883,7 @@ def align_transcript(
                                 window_start_ms=refinement_start,
                                 window_end_ms=refinement_end,
                                 reference_length=len(normalized.text),
+                                window_cache=window_cache,
                             )
                             if _is_cancelled(cancel):
                                 raise AlignmentCancelledError("alignment was cancelled")
@@ -2396,6 +2993,7 @@ def align_transcript(
                             window_start_ms=local_window_start,
                             window_end_ms=local_window_end,
                             reference_length=excerpt_normalized_length,
+                            window_cache=window_cache,
                         )
                         if local_force_track is not None:
                             force_track_available = True
@@ -2433,17 +3031,33 @@ def align_transcript(
                     )
 
             fallback = force_range is None and asr_range is None
+            used_character_force_boundary = False
             if asr_range is not None and force_range is not None:
                 preliminary_difference = max(
                     abs(force_range[0] - asr_range[0]),
                     abs(force_range[1] - asr_range[1]),
                 )
                 if preliminary_difference <= boundary_tolerance_ms:
-                    # Both timestamp mechanisms have similar published error
-                    # scales.  Their midpoint reduces one-sided boundary bias
-                    # while the actual-audio ASR still determines the location.
-                    proposed_start_ms = (asr_range[0] + force_range[0]) / 2
-                    proposed_end_ms = (asr_range[1] + force_range[1]) / 2
+                    if (
+                        force_context_consensus
+                        and asr_range.timestamp_precision != TIMESTAMP_PRECISION_CHARACTER
+                        and force_range.timestamp_precision == TIMESTAMP_PRECISION_CHARACTER
+                    ):
+                        # The ASR interval only has word/segment granularity, so
+                        # its edges systematically overshoot the highlighted
+                        # characters.  Two agreeing forced-alignment context
+                        # windows provide genuine per-character edges inside
+                        # the ASR-confirmed location; averaging with the wider
+                        # word span would only drag the cut outward again.
+                        proposed_start_ms, proposed_end_ms = force_range[:2]
+                        used_character_force_boundary = True
+                    else:
+                        # Both timestamp mechanisms have similar published
+                        # error scales.  Their midpoint reduces one-sided
+                        # boundary bias while the actual-audio ASR still
+                        # determines the location.
+                        proposed_start_ms = (asr_range[0] + force_range[0]) / 2
+                        proposed_end_ms = (asr_range[1] + force_range[1]) / 2
                 elif force_context_consensus and has_local_refinement:
                     # Two differently sized, audio-located transcript windows
                     # agree with each other.  That stable dedicated timestamp
@@ -2568,6 +3182,11 @@ def align_transcript(
                 and item.timestamp_precision != TIMESTAMP_PRECISION_CHARACTER
                 for item in (asr_range, force_range)
             )
+            if used_character_force_boundary:
+                # The cut edges come from agreeing per-character forced
+                # alignment; the coarser ASR word span only confirmed the
+                # location and no longer defines any boundary.
+                coarse_timestamp = False
             ambiguity_margin = min(
                 (
                     item.ambiguity_margin
@@ -2737,6 +3356,7 @@ def align_transcript(
                     else None
                 ),
                 "candidate_span_ms": round(candidate_span_ms, 3),
+                "used_character_force_boundary": used_character_force_boundary,
                 "alignment_ambiguity_margin": round(ambiguity_margin, 4),
                 "dp_forced_partition": dp_forced_partition,
                 "left_guard_sample": left_guard_sample,
@@ -2818,8 +3438,10 @@ __all__ = [
     "TimedSpan",
     "align_transcript",
     "alignment_track_from_model_result",
+    "alignment_track_from_recognition_tokens",
     "normalize_text",
     "normalize_with_mapping",
     "recognition_tokens_from_model_result",
+    "refine_recognition_tokens",
     "voice_ranges_from_model_result",
 ]

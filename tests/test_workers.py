@@ -22,6 +22,11 @@ from cutvideo.resources import RuntimeResources
 from cutvideo.ui.workers import CancelToken
 
 
+def _fake_envelope() -> WaveformEnvelope:
+    zeros = np.zeros(4, dtype=np.float32)
+    return WaveformEnvelope(48_000, 256, zeros, zeros.copy(), zeros.copy())
+
+
 def _ready_project(tmp_path: Path) -> ProjectV1:
     audio = tmp_path / "source.mp3"
     document = tmp_path / "source.docx"
@@ -67,14 +72,14 @@ def test_preflight_rejects_file_changed_while_decoding(
         def validate_audio_duration(self, _duration_ms: int) -> None:
             return None
 
-    def fake_probe(*_args: object, **_kwargs: object) -> AudioInfo:
+    def fake_probe(*_args: object, **_kwargs: object) -> tuple[AudioInfo, WaveformEnvelope]:
         audio.write_bytes(b"changed")
-        return AudioInfo(audio, 48_000, 2, 48_000, 1.0, "mp3")
+        return AudioInfo(audio, 48_000, 2, 48_000, 1.0, "mp3"), _fake_envelope()
 
     resources = RuntimeResources(tmp_path, tmp_path / "ffmpeg", tmp_path / "ffprobe", None, None, None)
     tools = FFmpegTools(tmp_path / "ffmpeg", tmp_path / "ffprobe")
     monkeypatch.setattr(workers, "parse_docx", lambda _path: Transcript())
-    monkeypatch.setattr(workers, "probe_audio", fake_probe)
+    monkeypatch.setattr(workers, "probe_audio_with_waveform", fake_probe)
     monkeypatch.setattr(workers, "discover_resources", lambda: resources)
     monkeypatch.setattr(workers, "discover_ffmpeg", lambda **_kwargs: tools)
 
@@ -125,9 +130,10 @@ def test_preflight_reuses_sidecar_after_all_inputs_are_moved(
     monkeypatch.setattr(workers, "parse_docx", lambda _path: Transcript())
     monkeypatch.setattr(
         workers,
-        "probe_audio",
-        lambda *_args, **_kwargs: AudioInfo(
-            moved_audio, 48_000, 2, 48_000, 1.0, "mp3"
+        "probe_audio_with_waveform",
+        lambda *_args, **_kwargs: (
+            AudioInfo(moved_audio, 48_000, 2, 48_000, 1.0, "mp3"),
+            _fake_envelope(),
         ),
     )
     monkeypatch.setattr(workers, "discover_resources", lambda: resources)
@@ -170,9 +176,10 @@ def test_preflight_does_not_reuse_previous_alignment_strategy(
     monkeypatch.setattr(workers, "parse_docx", lambda _path: Transcript())
     monkeypatch.setattr(
         workers,
-        "probe_audio",
-        lambda *_args, **_kwargs: AudioInfo(
-            Path(project.audio.path), 48_000, 2, 48_000, 1.0, "mp3"
+        "probe_audio_with_waveform",
+        lambda *_args, **_kwargs: (
+            AudioInfo(Path(project.audio.path), 48_000, 2, 48_000, 1.0, "mp3"),
+            _fake_envelope(),
         ),
     )
     monkeypatch.setattr(workers, "discover_resources", lambda: resources)

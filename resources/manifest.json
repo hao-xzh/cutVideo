@@ -31,6 +31,13 @@
       }
     }
   },
+  "selftest": {
+    "audio": "selftest/asr_example.wav",
+    "sha256": "a1bd32dc78493c123f9625a66deee562aed2895f53fbc39f2cca3be7e6f4f20f",
+    "transcript": "欢迎大家来到魔搭社区进行体验",
+    "source": "iic/speech_timestamp_prediction-v1-16k-offline/example/asr_example.wav",
+    "license": "licenses/Apache-2.0.txt"
+  },
   "models": {
     "fa-zh": {
       "path": "models/fa-zh",
@@ -52,6 +59,22 @@
       "license": "licenses/Apache-2.0.txt",
       "source": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
       "revision": "f9a8b8274674755d925277e27063869038d41515"
+    },
+    "qwen3-asr-0.6b-4bit": {
+      "path": "models/qwen3-asr-0.6b-4bit",
+      "sha256": "64bb06246c894891b2ab19dae69a8ab916562326274db15b313917150c983130",
+      "license": "licenses/Apache-2.0.txt",
+      "source": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B",
+      "revision": "mlx-4bit-local-conversion",
+      "quantization": "4bit"
+    },
+    "qwen3-forced-aligner-0.6b-4bit": {
+      "path": "models/qwen3-forced-aligner-0.6b-4bit",
+      "sha256": "860e94e0986be75a644ca383a9786e244e665bd99744b3920859c3de1747ce24",
+      "license": "licenses/Apache-2.0.txt",
+      "source": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B",
+      "revision": "mlx-4bit-local-conversion",
+      "quantization": "4bit"
     }
   }
 }

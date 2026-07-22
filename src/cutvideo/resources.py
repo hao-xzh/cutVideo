@@ -20,6 +20,8 @@ class RuntimeResources:
     fa_model: Path | None
     asr_model: Path | None
     vad_model: Path | None
+    qwen_asr_model: Path | None = None
+    qwen_force_model: Path | None = None
 
     @property
     def has_ffmpeg(self) -> bool:
@@ -27,10 +29,33 @@ class RuntimeResources:
 
     @property
     def has_models(self) -> bool:
-        return all(
+        return self.has_qwen_models or all(
             path is not None and path.is_dir()
             for path in (self.fa_model, self.asr_model, self.vad_model)
         )
+
+    @property
+    def has_qwen_models(self) -> bool:
+        return (
+            platform_key() == "macos-arm64"
+            and self.qwen_asr_model is not None
+            and self.qwen_asr_model.is_dir()
+            and self.qwen_force_model is not None
+            and self.qwen_force_model.is_dir()
+        )
+
+    @property
+    def recognition_backend(self) -> str:
+        if self.has_qwen_models:
+            return "qwen-mlx"
+        if (
+            self.asr_model is not None
+            and self.asr_model.is_dir()
+            and self.vad_model is not None
+            and self.vad_model.is_dir()
+        ):
+            return "funasr"
+        return "unavailable"
 
     def missing(self) -> list[str]:
         missing: list[str] = []
@@ -38,13 +63,14 @@ class RuntimeResources:
             missing.append("ffmpeg")
         if not self.ffprobe or not self.ffprobe.is_file():
             missing.append("ffprobe")
-        for label, path in (
-            ("fa-zh", self.fa_model),
-            ("paraformer-zh", self.asr_model),
-            ("fsmn-vad", self.vad_model),
-        ):
-            if not path or not path.is_dir():
-                missing.append(label)
+        if not self.has_models:
+            for label, path in (
+                ("fa-zh", self.fa_model),
+                ("paraformer-zh", self.asr_model),
+                ("fsmn-vad", self.vad_model),
+            ):
+                if not path or not path.is_dir():
+                    missing.append(label)
         return missing
 
 
@@ -105,6 +131,14 @@ def discover_resources() -> RuntimeResources:
         fa_model=_existing_dir(None, model_root / "fa-zh"),
         asr_model=_existing_dir(None, model_root / "paraformer-zh"),
         vad_model=_existing_dir(None, model_root / "fsmn-vad"),
+        qwen_asr_model=_existing_dir(
+            os.environ.get("CUTVIDEO_QWEN_ASR_MODEL"),
+            model_root / "qwen3-asr-0.6b-4bit",
+        ),
+        qwen_force_model=_existing_dir(
+            os.environ.get("CUTVIDEO_QWEN_FORCE_MODEL"),
+            model_root / "qwen3-forced-aligner-0.6b-4bit",
+        ),
     )
 
 

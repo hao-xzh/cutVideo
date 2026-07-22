@@ -10,6 +10,7 @@ import pytest
 from cutvideo.alignment import (
     ASR_ALIGNER_UNAVAILABLE,
     BOUNDARY_DISAGREEMENT,
+    COARSE_TIMESTAMP,
     FALLBACK_ALIGNMENT,
     FORCE_ALIGNER_UNAVAILABLE,
     INSUFFICIENT_COVERAGE,
@@ -18,14 +19,17 @@ from cutvideo.alignment import (
     SHORT_HIGHLIGHT,
     STATUS_AUTO_APPROVED,
     STATUS_NEEDS_REVIEW,
+    TIMESTAMP_PRECISION_TOKEN,
     AlignmentTrack,
     FunASRAsrAligner,
+    RecognizedToken,
     TimedSpan,
     _range_from_track,
     align_transcript,
     alignment_track_from_model_result,
     normalize_with_mapping,
     recognition_tokens_from_model_result,
+    refine_recognition_tokens,
 )
 from cutvideo.model_runtime import ModelUnavailableError, load_funasr_model
 
@@ -82,6 +86,7 @@ class RecordingAligner:
                 index + 1,
                 1_000 + index * 100 + self.delta_ms,
                 1_100 + index * 100 + self.delta_ms,
+                model_confidence=0.9,
             )
             for index in range(len(normalized))
         )
@@ -317,7 +322,8 @@ def test_missing_models_use_low_confidence_character_ratio_fallback() -> None:
 
     assert candidate.proposed_start_sample == round(10_000 * 2 / 7)
     assert candidate.proposed_end_sample == round(10_000 * 5 / 7)
-    assert candidate.confidence == 0.15
+    # Base fallback confidence 0.15 minus the missing-neighbor-guard penalty.
+    assert candidate.confidence == 0.07
     assert candidate.status == STATUS_NEEDS_REVIEW
     assert candidate.requires_review is True
     assert FALLBACK_ALIGNMENT in candidate.reasons
@@ -463,7 +469,7 @@ def test_asr_homophone_substitution_keeps_highlight_character_timestamp() -> Non
     assert track.coverage == 1.0
     highlighted_span = next(span for span in track.spans if span.normalized_start == 4)
     assert (highlighted_span.start_ms, highlighted_span.end_ms) == (400, 500)
-    assert highlighted_span.confidence == 0.9
+    assert 0.80 <= highlighted_span.confidence < 1.0
 
 
 def test_raw_recognition_tokens_keep_absolute_timestamps() -> None:
@@ -489,7 +495,9 @@ def test_highlight_range_rejects_sparse_matches_across_large_audio_hole() -> Non
     )
 
     # Wide paragraph/context lookup may legitimately span pauses.
-    assert _range_from_track(track, 0, 2) == (1_000, 4_100, 1.0)
+    wide = _range_from_track(track, 0, 2)
+    assert wide is not None
+    assert (wide.start_ms, wide.end_ms, wide.coverage) == (1_000, 4_100, 1.0)
     # A single yellow deletion must never silently include the intervening
     # 2.9 seconds just because one character matched on each side.
     assert (
@@ -585,10 +593,17 @@ def test_fa_serialized_text_parses_grouped_tokens_when_counts_differ() -> None:
     )
 
     assert track.coverage == 1.0
+    # A grouped token deliberately shares its real interval instead of being
+    # split evenly into fabricated per-character timestamps.
     assert [(span.start_ms, span.end_ms) for span in track.spans] == [
-        (100, 300),
-        (300, 500),
+        (100, 500),
+        (100, 500),
         (500, 700),
+    ]
+    assert [span.timestamp_precision for span in track.spans] == [
+        "token",
+        "token",
+        "character",
     ]
 
 
@@ -604,12 +619,14 @@ def test_funasr_loader_accepts_only_local_paths_and_forces_offline(tmp_path: Pat
     loaded = load_funasr_model(
         model_path=model,
         label="fa-zh",
+        device="cpu",
         model_factory=factory,
         extra_options={"disable_update": False},
     )
 
     assert loaded is not None
     assert captured["model"] == str(model.resolve())
+    assert captured["device"] == "cpu"
     assert captured["disable_update"] is True
     assert captured["disable_pbar"] is True
     assert captured["disable_log"] is True
@@ -622,6 +639,54 @@ def test_funasr_loader_accepts_only_local_paths_and_forces_offline(tmp_path: Pat
             label="fa-zh",
             model_factory=factory,
         )
+
+
+def test_resolve_inference_device_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cutvideo.model_runtime as runtime
+
+    monkeypatch.setenv("CUTVIDEO_INFERENCE_DEVICE", "cpu")
+    assert runtime.resolve_inference_device() == "cpu"
+    assert runtime.resolve_inference_device("cuda:0") == "cuda:0"
+    monkeypatch.delenv("CUTVIDEO_INFERENCE_DEVICE", raising=False)
+    monkeypatch.setattr(runtime, "prefer_inference_device", lambda: "mps")
+    assert runtime.resolve_inference_device() == "mps"
+
+
+def test_prepared_audio_window_cache_reuses_identical_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import wave
+
+    import cutvideo.model_runtime as runtime
+
+    source = tmp_path / "source.wav"
+    with wave.open(str(source), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16_000)
+        writer.writeframes(b"\x00\x00" * 16_000)
+
+    writes: list[tuple[int, int]] = []
+
+    def fake_write(src, output, *, start_ms, end_ms, **_kwargs):
+        writes.append((start_ms, end_ms))
+        output.write_bytes(b"RIFF" + b"\x00" * 44)
+        return output.resolve()
+
+    monkeypatch.setattr(runtime, "_write_local_audio_window", fake_write)
+    with runtime.PreparedAudioWindowCache(source) as cache:
+        first = cache.get(0, 500)
+        second = cache.get(0, 500)
+        third = cache.get(500, 1_000)
+
+    assert first == second
+    assert first != third
+    assert writes == [(0, 500), (500, 1_000)]
+    assert cache.hit_count == 1
+    assert cache.miss_count == 2
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DLL search path regression")
@@ -639,6 +704,236 @@ def test_frozen_torch_dll_paths_are_normalized(monkeypatch: pytest.MonkeyPatch) 
         runtime.os.add_dll_directory(r"D:\\workspace\\cutVideo\\torch\\lib")
 
     assert captured == [r"D:\workspace\cutVideo\torch\lib"]
+
+
+class _CharacterRefiner:
+    """Fake fa-zh returning genuine per-character intervals inside each window."""
+
+    def __init__(self, *, base_ms: float = 1_000.0, step_ms: float = 300.0) -> None:
+        self.base_ms = base_ms
+        self.step_ms = step_ms
+        self.calls: list[tuple[str, int, int]] = []
+
+    def align(
+        self,
+        *,
+        audio_path: str | Path,
+        transcript: str,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> AlignmentTrack:
+        del audio_path
+        self.calls.append((transcript, window_start_ms, window_end_ms))
+        normalized = normalize_with_mapping(transcript).text
+        spans = tuple(
+            TimedSpan(
+                index,
+                index + 1,
+                self.base_ms + index * self.step_ms,
+                self.base_ms + (index + 1) * self.step_ms,
+            )
+            for index in range(len(normalized))
+        )
+        return AlignmentTrack(spans, "fa-zh", 1.0)
+
+
+def test_refinement_sharpens_shared_word_interval_into_characters() -> None:
+    tokens = tuple(
+        RecognizedToken(text, 1_000, 1_900, 0.9, True, "token")
+        for text in "你好吗"
+    )
+    refiner = _CharacterRefiner()
+
+    refined, diagnostics = refine_recognition_tokens(
+        tokens,
+        force_aligner=refiner,
+        audio_path=Path("unused.wav"),
+        audio_end_ms=5_000,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in refined] == [
+        (1_000, 1_300),
+        (1_300, 1_600),
+        (1_600, 1_900),
+    ]
+    assert all(item.timestamp_precision == "character" for item in refined)
+    assert all(item.confidence_available for item in refined)
+    assert diagnostics["refined_token_count"] == 3
+    assert diagnostics["failed_group_count"] == 0
+    # The forced reference is the recognized text itself inside one padded window.
+    assert refiner.calls == [("你好吗", 800, 2_100)]
+
+
+def test_refinement_skips_groups_that_are_already_character_precise() -> None:
+    tokens = (
+        RecognizedToken("你", 1_000, 1_200, 0.9, True, "character"),
+        RecognizedToken("好", 1_200, 1_400, 0.9, True, "character"),
+        RecognizedToken("吗", 1_400, 1_600, 0.9, True, "character"),
+    )
+    refiner = _CharacterRefiner()
+
+    refined, diagnostics = refine_recognition_tokens(
+        tokens,
+        force_aligner=refiner,
+        audio_path=Path("unused.wav"),
+        audio_end_ms=5_000,
+    )
+
+    assert refined == tokens
+    assert refiner.calls == []
+    assert diagnostics["skipped_precise_group_count"] == 1
+    assert diagnostics["refined_token_count"] == 0
+
+
+def test_refinement_still_runs_when_character_label_shares_one_interval() -> None:
+    tokens = tuple(
+        RecognizedToken(text, 1_000, 1_900, 0.9, True, "character")
+        for text in "你好吗"
+    )
+    refiner = _CharacterRefiner()
+
+    refined, diagnostics = refine_recognition_tokens(
+        tokens,
+        force_aligner=refiner,
+        audio_path=Path("unused.wav"),
+        audio_end_ms=5_000,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in refined] == [
+        (1_000, 1_300),
+        (1_300, 1_600),
+        (1_600, 1_900),
+    ]
+    assert refiner.calls == [("你好吗", 800, 2_100)]
+    assert diagnostics["skipped_precise_group_count"] == 0
+
+
+def test_refinement_rejects_boundaries_far_from_original_interval() -> None:
+    tokens = tuple(
+        RecognizedToken(text, 1_000, 1_900, 0.9, True, "token")
+        for text in "你好吗"
+    )
+    # A refinement result four seconds away is not credible for these tokens.
+    refiner = _CharacterRefiner(base_ms=5_000.0)
+
+    refined, diagnostics = refine_recognition_tokens(
+        tokens,
+        force_aligner=refiner,
+        audio_path=Path("unused.wav"),
+        audio_end_ms=10_000,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in refined] == [
+        (1_000, 1_900),
+        (1_000, 1_900),
+        (1_000, 1_900),
+    ]
+    assert all(item.timestamp_precision == "token" for item in refined)
+    assert diagnostics["refined_token_count"] == 0
+
+
+def test_refinement_splits_groups_on_speech_gaps() -> None:
+    tokens = (
+        RecognizedToken("甲", 1_000, 1_400, 0.9, True, "token"),
+        RecognizedToken("乙", 1_000, 1_400, 0.9, True, "token"),
+        RecognizedToken("丙", 4_000, 4_400, 0.9, True, "token"),
+    )
+
+    class WindowRelativeRefiner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int, int]] = []
+
+        def align(self, *, audio_path, transcript, window_start_ms, window_end_ms):
+            del audio_path
+            self.calls.append((transcript, window_start_ms, window_end_ms))
+            normalized = normalize_with_mapping(transcript).text
+            base = window_start_ms + 200
+            spans = tuple(
+                TimedSpan(index, index + 1, base + index * 200, base + (index + 1) * 200)
+                for index in range(len(normalized))
+            )
+            return AlignmentTrack(spans, "fa-zh", 1.0)
+
+    refiner = WindowRelativeRefiner()
+    refined, diagnostics = refine_recognition_tokens(
+        tokens,
+        force_aligner=refiner,
+        audio_path=Path("unused.wav"),
+        audio_end_ms=10_000,
+    )
+
+    assert [call[0] for call in refiner.calls] == ["甲乙", "丙"]
+    assert diagnostics["group_count"] == 2
+    assert [(item.start_ms, item.end_ms) for item in refined] == [
+        (1_000, 1_200),
+        (1_200, 1_400),
+        (4_000, 4_200),
+    ]
+
+
+def test_coarse_asr_with_character_consensus_uses_forced_boundaries() -> None:
+    text = "前" * 25 + "删除词" + "后" * 25
+    parsed = Parsed(
+        [
+            Paragraph(0, 100, text, [Highlight(25, 28, "删除词")]),
+            Paragraph(1, 9_000, "收尾"),
+        ]
+    )
+
+    class TokenPrecisionAsr(RecordingAligner):
+        def align(self, **kwargs: object) -> AlignmentTrack:
+            self.calls.append(
+                (int(kwargs["window_start_ms"]), int(kwargs["window_end_ms"]))
+            )
+            normalized = normalize_with_mapping(str(kwargs["transcript"])).text
+            spans = tuple(
+                TimedSpan(
+                    index,
+                    index + 1,
+                    1_000 + index * 100 + self.delta_ms,
+                    1_100 + index * 100 + self.delta_ms,
+                    timestamp_precision=TIMESTAMP_PRECISION_TOKEN,
+                )
+                for index in range(len(normalized))
+            )
+            return AlignmentTrack(
+                spans,
+                "fake-token-precision",
+                self.coverage,
+                timestamp_precision=TIMESTAMP_PRECISION_TOKEN,
+            )
+
+    class StableContextAligner:
+        def align(self, **kwargs: object) -> AlignmentTrack:
+            normalized = normalize_with_mapping(str(kwargs["transcript"])).text
+            target = normalized.index("删除词")
+            return AlignmentTrack(
+                tuple(
+                    TimedSpan(
+                        index,
+                        index + 1,
+                        3_500 + (index - target) * 100,
+                        3_600 + (index - target) * 100,
+                    )
+                    for index in range(len(normalized))
+                ),
+                "stable-context",
+                1.0,
+            )
+
+    candidate = align_transcript(
+        parsed,
+        Audio(Path("unused.wav")),
+        StableContextAligner(),
+        TokenPrecisionAsr(delta_ms=40),
+    )[0]
+
+    # Both engines agree within tolerance, but the ASR interval only has word
+    # granularity, so the consensus per-character forced boundary is adopted
+    # instead of the midpoint with the wider word span.
+    assert (candidate.proposed_start_sample, candidate.proposed_end_sample) == (3_500, 3_800)
+    assert candidate.diagnostics["used_character_force_boundary"] is True
+    assert COARSE_TIMESTAMP not in candidate.reasons
 
 
 def test_asr_adapter_explicitly_requests_timestamps(

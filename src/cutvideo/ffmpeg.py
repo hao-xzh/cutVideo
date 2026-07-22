@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import wave
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -410,6 +411,46 @@ def _validate_audio_output(path: Path, tools: FFmpegTools) -> None:
         )
 
 
+def _pcm16_wav_shape(path: Path) -> tuple[int, int, int]:
+    """Return sample rate, channels and frame count for a playable preview WAV."""
+
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getcomptype() != "NONE" or reader.getsampwidth() != 2:
+                raise FFmpegError(f"试听文件不是 PCM 16-bit WAV：{path.name}")
+            return reader.getframerate(), reader.getnchannels(), reader.getnframes()
+    except FFmpegError:
+        raise
+    except (EOFError, OSError, wave.Error) as exc:
+        raise FFmpegError(f"无法核对试听文件：{path.name}") from exc
+
+
+def _validate_preview_difference(
+    original_path: Path,
+    edited_path: Path,
+    *,
+    expected_removed_samples: int,
+    input_sample_rate: int,
+) -> None:
+    """Reject a cut preview when its rendered WAV pair does not contain the cut."""
+
+    original_rate, original_channels, original_frames = _pcm16_wav_shape(original_path)
+    edited_rate, edited_channels, edited_frames = _pcm16_wav_shape(edited_path)
+    if (original_rate, original_channels) != (edited_rate, edited_channels):
+        raise FFmpegError("原音与剪后试听的音频格式不一致，已停止播放")
+    if expected_removed_samples <= 0:
+        return
+    expected_removed_frames = expected_removed_samples * original_rate / input_sample_rate
+    if expected_removed_frames < 1:
+        return
+    actual_removed_frames = original_frames - edited_frames
+    rounding_tolerance = max(4.0, original_rate * 4.0 / input_sample_rate)
+    if actual_removed_frames <= 0 or (
+        actual_removed_frames + rounding_tolerance < expected_removed_frames
+    ):
+        raise FFmpegError("剪后试听未实际移除删除范围，已停止播放")
+
+
 def _commit_output_pair(
     temporary: tuple[Path, Path],
     final: tuple[Path, Path],
@@ -698,16 +739,31 @@ def generate_preview(
     edited_output = Path(edited_wav_path).expanduser().resolve()
     original_output.parent.mkdir(parents=True, exist_ok=True)
     edited_output.parent.mkdir(parents=True, exist_ok=True)
+    interval_list = list(intervals)
+    total_samples = int(info.total_samples)  # type: ignore[attr-defined]
+    sample_rate = int(info.sample_rate)  # type: ignore[attr-defined]
+    channels = int(info.channels)  # type: ignore[attr-defined]
+    window_start = int(start_sample)
+    window_end = int(end_sample)
+    _cuts, kept = _kept_ranges(
+        interval_list,
+        total_samples,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    expected_removed_samples = (window_end - window_start) - sum(
+        end - start for start, end in kept
+    )
     argv = build_preview_command(
         audio_path,
-        intervals,
+        interval_list,
         original_output,
         edited_output,
-        start_sample=start_sample,
-        end_sample=end_sample,
-        total_samples=int(info.total_samples),  # type: ignore[attr-defined]
-        sample_rate=int(info.sample_rate),  # type: ignore[attr-defined]
-        channels=int(info.channels),  # type: ignore[attr-defined]
+        start_sample=window_start,
+        end_sample=window_end,
+        total_samples=total_samples,
+        sample_rate=sample_rate,
+        channels=channels,
         tools=resolved_tools,
         fade_ms=fade_ms,
         overwrite=overwrite,
@@ -715,6 +771,12 @@ def generate_preview(
     _run_with_progress(argv, cancel=cancel)
     _validate_audio_output(original_output, resolved_tools)
     _validate_audio_output(edited_output, resolved_tools)
+    _validate_preview_difference(
+        original_output,
+        edited_output,
+        expected_removed_samples=expected_removed_samples,
+        input_sample_rate=sample_rate,
+    )
     return PreviewResult(original_output, edited_output, tuple(argv))
 
 

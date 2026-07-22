@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollBar,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -57,12 +58,17 @@ from ..audio_processing import (
 from ..ffmpeg import FFmpegTools
 from .audio_player import AudioPlaybackError, PcmWavPlayer
 from .audio_processing_workers import (
+    AnnotationBoundaryRefinementResult,
     AudioProcessingAnalysisResult,
     AudioProcessingExportResult,
+    AudioProcessingRefinementResult,
+    _voice_ranges_ms_from_diagnostics,
+    make_annotation_boundary_refinement_operation,
     make_audio_processing_analysis_operation,
     make_audio_processing_export_operation,
     make_audio_processing_load_operation,
     make_audio_processing_preview_operation,
+    make_audio_processing_refinement_operation,
     make_audio_processing_relink_operation,
 )
 from .file_drop_edit import FileDropLineEdit
@@ -71,8 +77,14 @@ from .import_view import ImportLandingView
 from .progress_view import TaskProgressView
 from .settings import dialog_start, remember_dialog_path
 from .theme import theme_color
+from .typewriter import TypewriterTextController
 from .waveform import WaveformWidget
-from .workers import BackgroundTask, CandidatePreviewResult, make_waveform_operation
+from .workers import (
+    AsrTranscriptPartial,
+    BackgroundTask,
+    CandidatePreviewResult,
+    make_waveform_operation,
+)
 
 _SCROLL_STEPS = 100_000
 _AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
@@ -82,6 +94,7 @@ _REVIEW_REASON_LABELS = {
     "low_model_confidence": "局部识别置信度较低",
     "legacy_boundary_precision_unknown": "旧项目未保存时间戳精度",
     "boundary_precision_unverified": "边界精度尚未核验",
+    "boundary_refinement_evidence_incomplete": "声学边界证据不完整",
 }
 
 
@@ -89,6 +102,7 @@ class AudioProcessingWidget(QWidget):
     """Full audio transcription, region annotations, preview and export."""
 
     statusMessage = Signal(str)
+    transcriptPartial = Signal(int, object)
 
     def __init__(self, thread_pool: QThreadPool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -100,8 +114,11 @@ class AudioProcessingWidget(QWidget):
         self.tools: FFmpegTools | None = None
         self.waveform_envelope: WaveformEnvelope | None = None
         self._active_task: BackgroundTask | None = None
+        self._refinement_task: BackgroundTask | None = None
+        self._refinement_generation = 0
         self._task_uses_progress = True
         self._preview_spinner = ButtonSpinner(self)
+        self._active_preview_button: QAbstractButton | None = None
         self._token_document_ranges: list[tuple[int, int]] = []
         self._segment_label_ranges: list[tuple[int, int]] = []
         self._editing_annotation_id: str | None = None
@@ -114,17 +131,23 @@ class AudioProcessingWidget(QWidget):
         self._annotation_edit_active = False
         self._foreground_generation = 0
         self._source_generation = 0
+        self._transcription_generation = 0
+        self._active_transcription_generation = 0
         template = str(Path(QDir.tempPath()) / "cutvideo-audio-processing-XXXXXX")
         self._preview_directory = QTemporaryDir(template)
         self._player = PcmWavPlayer(self)
         self._player.failed.connect(self._playback_failed)
         self._player.finished.connect(lambda: self.statusMessage.emit("试听完成"))
-        self._player.active_changed.connect(lambda _active: self._refresh_controls())
+        self._player.active_changed.connect(self._playback_active_changed)
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(450)
         self._autosave_timer.timeout.connect(self._autosave)
         self._build_ui()
+        self._transcript_typewriter = TypewriterTextController(
+            self.transcript_edit,
+            self,
+        )
         self._connect_signals()
         self._refresh_controls()
 
@@ -141,38 +164,47 @@ class AudioProcessingWidget(QWidget):
         outer.addWidget(self.workspace_stack)
 
         root = QVBoxLayout(editor)
-        root.setContentsMargins(16, 8, 16, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         input_card = QFrame()
         input_card.setObjectName("inputCard")
         input_layout = QGridLayout(input_card)
-        input_layout.setContentsMargins(12, 9, 12, 9)
-        input_layout.setHorizontalSpacing(10)
-        input_layout.addWidget(QLabel("音频"), 0, 0)
+        input_layout.setContentsMargins(18, 10, 18, 10)
+        input_layout.setHorizontalSpacing(8)
+        input_layout.setVerticalSpacing(8)
+        audio_header_title = QLabel("音频")
+        audio_header_title.setObjectName("workspaceHeaderTitle")
+        input_layout.addWidget(audio_header_title, 0, 0)
         self.audio_path_edit = FileDropLineEdit((".mp3", ".wav", ".m4a", ".aac", ".flac"))
         self.audio_path_edit.setObjectName("processingAudioPathEdit")
         self.audio_path_edit.setPlaceholderText("拖入单独音频，或点击右侧选择文件")
+        self.audio_path_edit.setMinimumWidth(180)
+        self.audio_path_edit.setMaximumWidth(380)
         self.audio_browse_button = make_icon_button(
             "folder-open",
             "选择需要处理的音频",
+            size=32,
         )
         self.audio_browse_button.setObjectName("processingAudioBrowseButton")
-        self.open_project_button = QPushButton("打开项目…")
-        self.open_project_button.setObjectName("processingOpenProjectButton")
-        set_button_icon(self.open_project_button, "project")
-        self.transcribe_button = QPushButton("完整识别")
+        self.transcribe_button = QPushButton("连续识别")
         self.transcribe_button.setObjectName("processingTranscribeButton")
         self.transcribe_button.setProperty("primary", True)
-        set_button_icon(self.transcribe_button, "audio-primary")
+        set_button_icon(self.transcribe_button, "audio-primary", size=15)
         input_layout.addWidget(self.audio_path_edit, 0, 1)
         input_layout.addWidget(self.audio_browse_button, 0, 2)
-        input_layout.addWidget(self.open_project_button, 0, 3)
-        input_layout.addWidget(self.transcribe_button, 0, 4)
-        self.summary_label = QLabel("选择音频后执行完整识别")
-        self.summary_label.setObjectName("mutedLabel")
-        input_layout.addWidget(self.summary_label, 1, 1, 1, 4)
-        input_layout.setColumnStretch(1, 1)
+        input_layout.addWidget(self.transcribe_button, 0, 3)
+        self.summary_label = QLabel("选择音频后执行连续识别")
+        self.summary_label.setObjectName("headerSummary")
+        self.summary_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.summary_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.summary_label.setMinimumWidth(240)
+        input_layout.addWidget(self.summary_label, 0, 4)
+        input_layout.setColumnStretch(1, 3)
+        input_layout.setColumnStretch(4, 2)
         root.addWidget(input_card)
 
         self.task_progress = TaskProgressView()
@@ -185,22 +217,38 @@ class AudioProcessingWidget(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("audioProcessingSplitter")
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(8)
+        splitter.setHandleWidth(10)
+        # The transcript pane is the stable reading column. Only the waveform
+        # pane absorbs automatic width changes so loading/choosing a track does
+        # not push the text column sideways.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        self.splitter = splitter
 
         transcript_card = QFrame()
         transcript_card.setObjectName("reviewCard")
+        transcript_card.setMinimumWidth(400)
         transcript_layout = QVBoxLayout(transcript_card)
-        transcript_layout.setContentsMargins(10, 9, 10, 10)
+        transcript_layout.setContentsMargins(14, 12, 14, 12)
+        transcript_layout.setSpacing(10)
         transcript_heading = QHBoxLayout()
+        transcript_heading.setSpacing(8)
         transcript_title = QLabel("完整转写")
         transcript_title.setObjectName("sectionTitle")
         self.selection_label = QLabel("拖选文字后建立标注")
         self.selection_label.setObjectName("mutedLabel")
+        self.selection_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.selection_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self.transcript_search = QLineEdit()
         self.transcript_search.setObjectName("processingTranscriptSearch")
         self.transcript_search.setPlaceholderText("搜索转写")
         self.transcript_search.setMaximumWidth(170)
-        self.transcript_search_button = make_icon_button("search", "查找下一处转写文字")
+        self.transcript_search_button = make_icon_button("search", "查找下一处转写文字", size=30)
         transcript_heading.addWidget(transcript_title)
         transcript_heading.addStretch(1)
         transcript_heading.addWidget(self.selection_label)
@@ -211,25 +259,34 @@ class AudioProcessingWidget(QWidget):
         self.transcript_edit.setObjectName("processingTranscriptEdit")
         self.transcript_edit.setReadOnly(True)
         self.transcript_edit.setAcceptRichText(False)
-        self.transcript_edit.setPlaceholderText("完整识别完成后，文字会在这里按语音停顿分段显示")
+        self.transcript_edit.setPlaceholderText(
+            "连续识别开始后，真实文字会从前到后持续显示"
+        )
         self.transcript_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         transcript_layout.addWidget(self.transcript_edit, 1)
         self.add_delete_button = QPushButton("标记删除")
         self.add_delete_button.setObjectName("processingAddDeleteButton")
-        self.add_delete_button.setProperty("primary", True)
-        set_button_icon(self.add_delete_button, "delete")
+        self.add_delete_button.setProperty("accentOutline", True)
+        set_button_icon(self.add_delete_button, "delete", size=15)
         self.add_delete_button.setToolTip("将当前文字或波形范围标记为删除")
         self.preview_text_button = QPushButton("试听文字")
         self.preview_text_button.setObjectName("processingPreviewTextButton")
-        set_button_icon(self.preview_text_button, "play")
+        set_button_icon(self.preview_text_button, "play", size=15)
         self.preview_text_button.setToolTip("试听当前选中文字对应的音频")
+        transcript_actions = QHBoxLayout()
+        transcript_actions.setSpacing(8)
+        transcript_actions.addWidget(self.add_delete_button)
+        transcript_actions.addWidget(self.preview_text_button)
+        transcript_actions.addStretch(1)
+        transcript_layout.addLayout(transcript_actions)
         splitter.addWidget(transcript_card)
 
         detail_card = QFrame()
         detail_card.setObjectName("reviewCard")
+        detail_card.setMinimumWidth(440)
         detail_layout = QVBoxLayout(detail_card)
-        detail_layout.setContentsMargins(10, 9, 10, 10)
-        detail_layout.setSpacing(8)
+        detail_layout.setContentsMargins(14, 16, 14, 16)
+        detail_layout.setSpacing(10)
         detail_title = QLabel("范围与删除标注")
         detail_title.setObjectName("sectionTitle")
         detail_layout.addWidget(detail_title)
@@ -237,21 +294,27 @@ class AudioProcessingWidget(QWidget):
             "文字决定标注内容，橙色时间范围决定实际删除音频；拖边界精调，Alt+拖动平移"
         )
         waveform_hint.setObjectName("mutedLabel")
+        waveform_hint.setWordWrap(True)
+        waveform_hint.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         detail_layout.addWidget(waveform_hint)
         self.waveform = WaveformWidget()
         self.waveform.setObjectName("processingWaveform")
         self.waveform.set_selection_drawing_enabled(True)
-        self.waveform.set_placeholder("完成完整识别后将在这里显示可框选波形")
+        self.waveform.set_placeholder("完成连续识别后将在这里显示可框选波形")
         detail_layout.addWidget(self.waveform, 1)
 
         view_layout = QHBoxLayout()
+        view_layout.setSpacing(6)
         view_layout.addWidget(QLabel("视野"))
         self.waveform_scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.waveform_scrollbar.setObjectName("processingWaveformScrollBar")
         self.waveform_scrollbar.setRange(0, 0)
-        self.zoom_out_button = make_icon_button("zoom-out", "缩小波形视野")
-        self.zoom_in_button = make_icon_button("zoom-in", "放大波形视野")
-        self.focus_button = make_icon_button("focus", "定位当前选择范围")
+        self.zoom_out_button = make_icon_button("zoom-out", "缩小波形视野", size=30)
+        self.zoom_in_button = make_icon_button("zoom-in", "放大波形视野", size=30)
+        self.focus_button = make_icon_button("focus", "定位当前选择范围", size=30)
         view_layout.addWidget(self.waveform_scrollbar, 1)
         view_layout.addWidget(self.zoom_out_button)
         view_layout.addWidget(self.zoom_in_button)
@@ -259,75 +322,116 @@ class AudioProcessingWidget(QWidget):
         detail_layout.addLayout(view_layout)
 
         boundary_layout = QGridLayout()
+        boundary_layout.setHorizontalSpacing(10)
+        boundary_layout.setVerticalSpacing(6)
         self.start_spin = _time_spin("processingStartSpin")
         self.end_spin = _time_spin("processingEndSpin")
         boundary_layout.addWidget(QLabel("删除 / 试听开始"), 0, 0)
         boundary_layout.addWidget(QLabel("删除 / 试听结束"), 0, 1)
         boundary_layout.addWidget(self.start_spin, 1, 0)
         boundary_layout.addWidget(self.end_spin, 1, 1)
-        detail_layout.addLayout(boundary_layout)
+        self.start_spin.setMinimumWidth(118)
+        self.end_spin.setMinimumWidth(118)
 
         self.preview_original_button = QPushButton("原音 ±3s")
-        set_button_icon(self.preview_original_button, "play")
-        self.preview_original_button.setToolTip("试听删除范围前后各 3 秒的原始音频")
+        self.preview_original_button.setProperty("compact", True)
+        self.preview_original_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_original_button, "play", size=15)
+        self.preview_original_button.setToolTip("试听删除范围前后各 3 秒的原始音频；再次点击停止")
         self.preview_selection_button = QPushButton("删除段")
-        set_button_icon(self.preview_selection_button, "play")
-        self.preview_selection_button.setToolTip("只试听将要删除的音频范围")
+        self.preview_selection_button.setProperty("compact", True)
+        self.preview_selection_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_selection_button, "play", size=15)
+        self.preview_selection_button.setToolTip("只试听将要删除的音频范围；再次点击停止")
         self.preview_edited_button = QPushButton("删除后")
-        set_button_icon(self.preview_edited_button, "play")
-        self.preview_edited_button.setToolTip("试听移除当前删除范围后的衔接效果")
-        self.stop_button = make_icon_button("stop", "停止试听", size=30)
+        self.preview_edited_button.setProperty("compact", True)
+        self.preview_edited_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_edited_button, "play", size=15)
+        self.preview_edited_button.setToolTip("试听移除当前删除范围后的衔接效果；再次点击停止")
 
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(8)
-        action_layout.addWidget(self.add_delete_button)
-        action_layout.addWidget(self.preview_text_button)
-        action_layout.addStretch(1)
-        action_layout.addWidget(self.preview_original_button)
-        action_layout.addWidget(self.preview_selection_button)
-        action_layout.addWidget(self.preview_edited_button)
-        action_layout.addWidget(self.stop_button)
-        detail_layout.addLayout(action_layout)
+        detail_layout.addLayout(boundary_layout)
+
+        preview_label = QLabel("试听对比")
+        preview_label.setObjectName("controlCaption")
+        preview_group = QFrame()
+        preview_group.setObjectName("previewControlGroup")
+        preview_group_layout = QHBoxLayout(preview_group)
+        preview_group_layout.setContentsMargins(2, 2, 2, 2)
+        preview_group_layout.setSpacing(1)
+        preview_group_layout.addWidget(self.preview_original_button)
+        preview_group_layout.addWidget(self.preview_selection_button)
+        preview_group_layout.addWidget(self.preview_edited_button)
+
+        preview_strip = QHBoxLayout()
+        preview_strip.setSpacing(10)
+        preview_strip.addWidget(preview_label)
+        preview_strip.addStretch(1)
+        preview_strip.addWidget(preview_group)
+        detail_layout.addLayout(preview_strip)
 
         annotation_heading = QHBoxLayout()
+        annotation_heading.setSpacing(8)
         annotation_title = QLabel("删除标注")
         annotation_title.setObjectName("sectionTitle")
         self.annotation_summary = QLabel("0 项")
         self.annotation_summary.setObjectName("mutedLabel")
+        self.annotation_summary.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.annotation_summary.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         annotation_heading.addWidget(annotation_title)
         annotation_heading.addStretch(1)
         annotation_heading.addWidget(self.annotation_summary)
+        self.confirm_boundary_button = QPushButton("确认边界")
+        self.confirm_boundary_button.setObjectName("processingConfirmBoundaryButton")
+        self.confirm_boundary_button.setProperty("accentOutline", True)
+        set_button_icon(self.confirm_boundary_button, "check", size=15)
+        self.remove_annotation_button = QPushButton("取消所选标注")
+        self.remove_annotation_button.setObjectName("processingRemoveAnnotationButton")
+        self.remove_annotation_button.setProperty("secondary", True)
+        annotation_heading.addWidget(self.confirm_boundary_button)
+        annotation_heading.addWidget(self.remove_annotation_button)
         detail_layout.addLayout(annotation_heading)
         self.annotation_table = QTableWidget(0, 3)
         self.annotation_table.setObjectName("processingAnnotationTable")
         self.annotation_table.setHorizontalHeaderLabels(["文字", "范围", "状态"])
+        self.annotation_table.setAlternatingRowColors(True)
+        self.annotation_table.setShowGrid(False)
         self.annotation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.annotation_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.annotation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.annotation_table.verticalHeader().setVisible(False)
+        self.annotation_table.verticalHeader().setDefaultSectionSize(34)
         annotation_header = self.annotation_table.horizontalHeader()
+        annotation_header.setHighlightSections(False)
+        annotation_header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         annotation_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        annotation_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        annotation_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        # Keep the right pane's minimum width stable while waveform boundaries
+        # update. ResizeToContents recalculates on every timestamp change and can
+        # make QSplitter borrow pixels from the transcript pane during a drag.
+        annotation_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        annotation_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        annotation_header.resizeSection(1, 160)
+        annotation_header.resizeSection(2, 76)
         detail_layout.addWidget(self.annotation_table, 1)
-        annotation_actions = QHBoxLayout()
-        self.confirm_boundary_button = QPushButton("确认边界")
-        self.confirm_boundary_button.setObjectName("processingConfirmBoundaryButton")
-        set_button_icon(self.confirm_boundary_button, "check")
-        self.remove_annotation_button = QPushButton("取消所选标注")
-        self.remove_annotation_button.setObjectName("processingRemoveAnnotationButton")
-        annotation_actions.addStretch(1)
-        annotation_actions.addWidget(self.confirm_boundary_button)
-        annotation_actions.addWidget(self.remove_annotation_button)
-        detail_layout.addLayout(annotation_actions)
-        splitter.addWidget(detail_card)
-        splitter.setSizes([520, 800])
+        detail_inset = QWidget()
+        detail_inset.setObjectName("rightWorkspaceInset")
+        detail_inset_layout = QVBoxLayout(detail_inset)
+        detail_inset_layout.setContentsMargins(0, 8, 0, 8)
+        detail_inset_layout.setSpacing(0)
+        detail_inset_layout.addWidget(detail_card)
+        splitter.addWidget(detail_inset)
+        splitter.setSizes([480, 840])
         root.addWidget(splitter, 1)
 
         export_card = QFrame()
         export_card.setObjectName("exportCard")
         export_layout = QHBoxLayout(export_card)
-        export_layout.setContentsMargins(12, 8, 12, 8)
+        export_layout.setContentsMargins(14, 10, 14, 10)
+        export_layout.setSpacing(8)
         export_title = QLabel("导出位置")
         export_title.setObjectName("sectionTitle")
         self.output_edit = QLineEdit()
@@ -335,11 +439,13 @@ class AudioProcessingWidget(QWidget):
         self.output_browse_button = make_icon_button(
             "folder-open",
             "选择导出目录",
+            size=32,
         )
         self.export_button = QPushButton("导出处理完成音频")
         self.export_button.setObjectName("processingExportButton")
         self.export_button.setProperty("primary", True)
-        set_button_icon(self.export_button, "export")
+        self.export_button.setMinimumWidth(180)
+        set_button_icon(self.export_button, "export", size=15)
         export_layout.addWidget(export_title)
         export_layout.addWidget(self.output_edit, 1)
         export_layout.addWidget(self.output_browse_button)
@@ -348,15 +454,16 @@ class AudioProcessingWidget(QWidget):
 
     def _connect_signals(self) -> None:
         self.import_view.audioBrowseRequested.connect(self._choose_audio)
-        self.import_view.projectBrowseRequested.connect(self._choose_project)
         self.import_view.audioDropped.connect(self._set_imported_audio)
         self.audio_browse_button.clicked.connect(self._choose_audio)
         self.audio_path_edit.textChanged.connect(self._audio_path_changed)
         self.audio_path_edit.fileDropped.connect(
-            lambda path: self.statusMessage.emit(f"已拖入音频：{Path(path).name}，可以开始完整识别")
+            lambda path: self.statusMessage.emit(
+                f"已拖入音频：{Path(path).name}，可以开始连续识别"
+            )
         )
-        self.open_project_button.clicked.connect(self._choose_project)
         self.transcribe_button.clicked.connect(self._start_transcription)
+        self.transcriptPartial.connect(self._transcript_partial_ready)
         self.task_progress.cancelRequested.connect(self._cancel_task)
         self.transcript_edit.selectionChanged.connect(self._text_selection_changed)
         self.transcript_edit.customContextMenuRequested.connect(self._show_transcript_menu)
@@ -389,7 +496,6 @@ class AudioProcessingWidget(QWidget):
         self.preview_edited_button.clicked.connect(
             lambda: self._start_preview("edited", self.preview_edited_button)
         )
-        self.stop_button.clicked.connect(self._stop_playback)
         self.output_browse_button.clicked.connect(self._choose_output)
         self.output_edit.textChanged.connect(self._output_changed)
         self.export_button.clicked.connect(self._start_export)
@@ -428,13 +534,21 @@ class AudioProcessingWidget(QWidget):
     def _set_imported_audio(self, path: str) -> None:
         remember_dialog_path("processing_audio", path)
         self.audio_path_edit.setText(path)
-        self.statusMessage.emit(f"已选择音频：{Path(path).name}，可以开始完整识别")
+        self.statusMessage.emit(f"已选择音频：{Path(path).name}，可以开始连续识别")
 
     def _audio_path_changed(self, value: str) -> None:
         if self._setting_audio_path:
             return
         self._foreground_generation += 1
         self._source_generation += 1
+        was_transcribing = bool(self._active_transcription_generation)
+        if was_transcribing:
+            # Invalidate queued partial signals immediately; cancellation is
+            # cooperative and the old worker may still finish its current
+            # model window after the user has selected a different source.
+            self._active_transcription_generation = 0
+            self._transcript_typewriter.clear()
+        self._cancel_refinement_task()
         if self._active_task is not None:
             self._active_task.cancel()
         self._player.stop()
@@ -445,12 +559,17 @@ class AudioProcessingWidget(QWidget):
             current_source = str(self.audio_info.path)
         if current_source and Path(value).expanduser() != Path(current_source).expanduser():
             self._clear_project_for_new_source()
+        elif was_transcribing and self.project is not None:
+            self._render_transcript()
         self.import_view.set_paths(value)
         self._sync_workspace_page()
         self._refresh_controls()
 
     def _clear_project_for_new_source(self) -> None:
         self._player.stop()
+        self._cancel_refinement_task()
+        self._active_transcription_generation = 0
+        self._transcript_typewriter.clear()
         self.project = None
         self.project_path = None
         self.audio_info = None
@@ -467,7 +586,7 @@ class AudioProcessingWidget(QWidget):
         self.annotation_table.setRowCount(0)
         self.waveform.clear()
         self.output_edit.clear()
-        self.summary_label.setText("选择音频后执行完整识别")
+        self.summary_label.setText("选择音频后执行连续识别")
         self.selection_label.setText("拖选文字后建立标注")
         self.annotation_summary.setText("0 项")
         with QSignalBlocker(self.start_spin), QSignalBlocker(self.end_spin):
@@ -515,6 +634,8 @@ class AudioProcessingWidget(QWidget):
             self.output_edit.setText(path)
 
     def _start_transcription(self) -> None:
+        if self._active_task is not None:
+            return
         path = self.audio_path_edit.text().strip()
         source = Path(path).expanduser()
         if not source.is_file() or source.suffix.casefold() not in _AUDIO_SUFFIXES:
@@ -524,11 +645,47 @@ class AudioProcessingWidget(QWidget):
                 "请选择一个存在且格式受支持的音频文件。",
             )
             return
-        self._start_task(make_audio_processing_analysis_operation(path), self._analysis_ready)
-        self.statusMessage.emit("正在完整识别音频，所有处理均在本机完成…")
+        self._cancel_refinement_task()
+        self._transcription_generation += 1
+        generation = self._transcription_generation
+        self._active_transcription_generation = generation
+        self._token_document_ranges.clear()
+        self._segment_label_ranges.clear()
+        self._transcript_typewriter.start(
+            "正在启动本地连续识别，真实文字会从前到后持续显示…"
+        )
+        self.summary_label.setText("正在启动连续识别…")
+        self._start_task(
+            make_audio_processing_analysis_operation(
+                path,
+                partial_cb=lambda partial: self.transcriptPartial.emit(
+                    generation,
+                    partial,
+                ),
+            ),
+            self._analysis_ready,
+        )
+        self.statusMessage.emit("正在连续识别音频，文字会持续追加且全部在本机处理…")
+
+    def _transcript_partial_ready(self, generation: int, value: object) -> None:
+        if generation != self._active_transcription_generation:
+            return
+        assert isinstance(value, AsrTranscriptPartial)
+        self._transcript_typewriter.append_text(value.delta_text)
+        self.summary_label.setText(
+            f"持续识别中 · {value.sequence}/{value.total_sequences} 段 · "
+            f"已输出 {value.token_count} 个文字 · "
+            f"{value.committed_until_ms / 1000:.1f}/{value.total_duration_ms / 1000:.1f} 秒"
+        )
+        self.statusMessage.emit(
+            f"连续识别 {value.sequence}/{value.total_sequences}："
+            f"已输出 {value.token_count} 个文字"
+        )
 
     def _analysis_ready(self, value: object) -> None:
         assert isinstance(value, AudioProcessingAnalysisResult)
+        self._active_transcription_generation = 0
+        self._transcript_typewriter.stop()
         if not value.source_matches:
             QMessageBox.information(
                 self,
@@ -580,9 +737,38 @@ class AudioProcessingWidget(QWidget):
             f"{len(value.project.segment_starts)} 个人声段 · 音频 {duration} · "
             f"{len(value.project.annotations)} 个删除标注"
         )
-        self.statusMessage.emit(
-            f"完整识别完成：{len(value.project.tokens)} 个时间戳文字，可选择文字建立标注"
+        semantic_upgrade_required = bool(
+            value.project.analysis_diagnostics.get(
+                "semantic_segmentation_upgrade_required"
+            )
         )
+        if semantic_upgrade_required:
+            self.summary_label.setText(
+                self.summary_label.text() + " · 旧项目需重新识别以启用语义分段"
+            )
+        if value.refinement_pending:
+            self.summary_label.setText(
+                self.summary_label.text() + " · 后台细化逐字时间戳中"
+            )
+            self.statusMessage.emit(
+                f"已流式输出 {len(value.project.tokens)} 个文字；"
+                "正在后台完成逐字对齐，对齐后即可精确选择和试听…"
+                + (
+                    "；该旧项目需重新导入原音频才能使用语义分段"
+                    if semantic_upgrade_required
+                    else ""
+                )
+            )
+            QTimer.singleShot(0, lambda: self._start_refinement_task(value))
+        elif semantic_upgrade_required:
+            self.statusMessage.emit(
+                "旧项目未保存 Qwen 原始标点；已用长停顿改善分段，"
+                "重新导入同一音频后可启用完整语义分段"
+            )
+        else:
+            self.statusMessage.emit(
+                f"连续识别完成：{len(value.project.tokens)} 个时间戳文字，可选择文字建立标注"
+            )
         self.waveform.clear()
         expected_path = str(value.audio_info.path)
         if value.waveform_envelope is not None:
@@ -608,6 +794,115 @@ class AudioProcessingWidget(QWidget):
                     waveform_ready,
                 ),
             )
+
+    def _start_refinement_task(self, draft: AudioProcessingAnalysisResult) -> None:
+        if (
+            self.project is None
+            or self.project_path is None
+            or self.project_path.resolve() != draft.project_path.resolve()
+        ):
+            return
+        self._cancel_refinement_task()
+        self._refinement_generation += 1
+        generation = self._refinement_generation
+        source_generation = self._source_generation
+        task = BackgroundTask(
+            make_audio_processing_refinement_operation(
+                draft.project,
+                draft.project_path,
+                audio_info=draft.audio_info,
+                tools=draft.tools,
+            )
+        )
+        self._refinement_task = task
+        task.signals.progress.connect(
+            lambda _percent, message: self._refinement_progress(generation, message)
+        )
+        task.signals.result.connect(
+            lambda value: self._refinement_ready(generation, source_generation, value)
+        )
+        task.signals.error.connect(
+            lambda message: self._refinement_failed(generation, message)
+        )
+        task.signals.cancelled.connect(lambda: self._refinement_cancelled(generation))
+        task.signals.finished.connect(lambda: self._refinement_finished(task))
+        self.thread_pool.start(task)
+        self._refresh_controls()
+
+    def _refinement_progress(self, generation: int, message: str) -> None:
+        if generation != self._refinement_generation:
+            return
+        if message:
+            self.statusMessage.emit(message)
+
+    def _refinement_ready(
+        self,
+        generation: int,
+        source_generation: int,
+        value: object,
+    ) -> None:
+        if generation != self._refinement_generation:
+            return
+        if source_generation != self._source_generation:
+            return
+        assert isinstance(value, AudioProcessingRefinementResult)
+        if (
+            self.project is None
+            or self.project_path is None
+            or self.project_path.resolve() != value.project_path.resolve()
+        ):
+            return
+        selected = self._selected_token_range()
+        editing_id = self._editing_annotation_id
+        self.project = value.project
+        self._render_transcript()
+        self._populate_annotations(select_id=editing_id)
+        if selected is not None:
+            self._select_tokens(*selected)
+            self._text_selection_changed()
+        duration = _format_sample(
+            value.project.audio_info.total_samples,
+            value.project.audio_info.sample_rate,
+        )
+        self.summary_label.setText(
+            f"{len(value.project.tokens)} 个带时间戳文字 · "
+            f"{len(value.project.segment_starts)} 个人声段 · 音频 {duration} · "
+            f"{len(value.project.annotations)} 个删除标注"
+        )
+        self.statusMessage.emit(
+            f"逐字时间戳已细化完成（更新 {value.updated_token_count} 个文字边界）"
+        )
+        self._refresh_controls()
+
+    def _refinement_failed(self, generation: int, message: str) -> None:
+        if generation != self._refinement_generation:
+            return
+        if self.project is not None:
+            self.project.analysis_diagnostics = {
+                **self.project.analysis_diagnostics,
+                "character_refinement_status": "failed",
+                "character_refinement_error": message,
+            }
+        self.statusMessage.emit(
+            f"后台逐字精修失败，文字试听和文字标注已停用；请重新识别：{message}"
+        )
+        self._refresh_controls()
+
+    def _refinement_cancelled(self, generation: int) -> None:
+        if generation != self._refinement_generation:
+            return
+        self.statusMessage.emit("后台逐字精修已取消")
+
+    def _refinement_finished(self, task: BackgroundTask) -> None:
+        if self._refinement_task is task:
+            self._refinement_task = None
+            self._refresh_controls()
+
+    def _cancel_refinement_task(self) -> None:
+        if self._refinement_task is not None:
+            self._refinement_task.cancel()
+            self._refinement_task = None
+            self._refinement_generation += 1
 
     def _waveform_ready(
         self,
@@ -638,6 +933,7 @@ class AudioProcessingWidget(QWidget):
     def _render_transcript(self) -> None:
         if self.project is None:
             return
+        self._transcript_typewriter.stop()
         parts: list[str] = []
         ranges: list[tuple[int, int]] = []
         position = 0
@@ -697,6 +993,17 @@ class AudioProcessingWidget(QWidget):
             self._refresh_controls()
             return
         left, right = token_range
+        cursor = self.transcript_edit.textCursor()
+        token_selection_start = self._token_document_ranges[left][0]
+        token_selection_end = self._token_document_ranges[right - 1][1]
+        if (
+            cursor.selectionStart() != token_selection_start
+            or cursor.selectionEnd() != token_selection_end
+        ):
+            # A timestamp belongs to the whole recognition token.  Snapping
+            # the visible selection avoids claiming that half of a word has an
+            # independently verified audio boundary.
+            self._select_tokens(left, right)
         selected_tokens = self.project.tokens[left:right]
         start = selected_tokens[0].start_sample
         end = selected_tokens[-1].end_sample
@@ -739,6 +1046,9 @@ class AudioProcessingWidget(QWidget):
         if self.project is None:
             return
         text_token_range = self._selected_token_range()
+        if text_token_range is not None and not self._text_timestamps_ready():
+            self.statusMessage.emit("精确逐字对齐尚未完成，暂不能按文字建立标注")
+            return
         token_range = text_token_range or self._tokens_for_waveform_selection()
         if token_range is None:
             QMessageBox.information(self, "没有选择范围", "请先拖选转写文字或在波形上框选一段语音。")
@@ -755,7 +1065,11 @@ class AudioProcessingWidget(QWidget):
             if item.start_sample <= recognized_end and item.end_sample >= recognized_start
         ]
         annotation = self.project.add_delete_annotation(*token_range)
-        if self.waveform_envelope is not None and waveform_end > waveform_start:
+        if (
+            text_token_range is None
+            and self.waveform_envelope is not None
+            and waveform_end > waveform_start
+        ):
             annotation.start_sample = min(
                 waveform_start,
                 *(item.start_sample for item in overlapping),
@@ -774,11 +1088,104 @@ class AudioProcessingWidget(QWidget):
         self._schedule_autosave()
         if annotation.review_required:
             self.statusMessage.emit(
-                f"已建立删除标注：{annotation.text}；模型时间仅是初始建议，请试听并确认波形边界"
+                f"已建立删除标注：{annotation.text}；正在后台按声学边界自动细化…"
             )
+            self._start_boundary_refinement(annotation)
         else:
             self.statusMessage.emit(
                 f"已建立删除标注：{annotation.text}；可在右侧拖动边界并反复试听"
+            )
+
+    def _start_boundary_refinement(self, annotation: AudioAnnotation) -> None:
+        """Snap a freshly created model-timestamp annotation to acoustic edges."""
+
+        if (
+            self.project is None
+            or self.audio_info is None
+            or self.tools is None
+            or self._active_task is not None
+        ):
+            return
+        tokens = self.project.tokens
+        left_guard = (
+            tokens[annotation.token_start - 1].end_sample
+            if annotation.token_start > 0
+            else None
+        )
+        right_guard = (
+            tokens[annotation.token_end].start_sample
+            if annotation.token_end < len(tokens)
+            else None
+        )
+        if left_guard is not None and left_guard >= annotation.end_sample:
+            left_guard = None
+        if right_guard is not None and right_guard <= annotation.start_sample:
+            right_guard = None
+        voice_ranges = _voice_ranges_ms_from_diagnostics(
+            self.project.analysis_diagnostics
+        )
+        self._start_task(
+            make_annotation_boundary_refinement_operation(
+                audio_path=self.project.audio.path,
+                info=self.audio_info,
+                tools=self.tools,
+                annotation_id=annotation.id,
+                start_sample=annotation.start_sample,
+                end_sample=annotation.end_sample,
+                left_guard_sample=left_guard,
+                right_guard_sample=right_guard,
+                selected_text=annotation.text,
+                voice_ranges_ms=voice_ranges,
+            ),
+            self._boundary_refinement_ready,
+            show_progress=False,
+        )
+
+    def _boundary_refinement_ready(self, value: object) -> None:
+        assert isinstance(value, AnnotationBoundaryRefinementResult)
+        if self.project is None:
+            return
+        annotation = next(
+            (item for item in self.project.annotations if item.id == value.annotation_id),
+            None,
+        )
+        if (
+            annotation is None
+            or not annotation.review_required
+            or annotation.start_sample != value.initial_start_sample
+            or annotation.end_sample != value.initial_end_sample
+        ):
+            # The annotation was removed or manually adjusted while the
+            # background refinement ran; the user's own boundary wins.
+            return
+        applied = self.project.apply_annotation_boundary_refinement(
+            value.annotation_id,
+            start_sample=value.refined_start_sample,
+            end_sample=value.refined_end_sample,
+            evidence_complete=value.evidence_complete,
+            diagnostics=dict(value.diagnostics),
+        )
+        if applied is None:
+            return
+        selected = self._editing_annotation_id == applied.id
+        self._populate_annotations(select_id=self._editing_annotation_id)
+        self._refresh_transcript_formats()
+        if selected and self.waveform_envelope is not None:
+            self.waveform.set_selection(applied.start_sample, applied.end_sample)
+            self._set_spin_samples(applied.start_sample, applied.end_sample)
+        self._reset_annotation_baseline()
+        self._schedule_autosave()
+        if applied.review_required:
+            reason_text = "；".join(
+                _REVIEW_REASON_LABELS.get(reason, reason)
+                for reason in applied.review_reasons
+            )
+            self.statusMessage.emit(
+                f"删除边界已按声学证据细化，仍需复核：{reason_text}"
+            )
+        else:
+            self.statusMessage.emit(
+                "删除边界已自动对齐到静音处并通过声学校验，可直接试听或导出"
             )
 
     def _confirm_selected_boundary(self) -> None:
@@ -809,36 +1216,46 @@ class AudioProcessingWidget(QWidget):
             self.statusMessage.emit("已取消所选删除标注")
 
     def _populate_annotations(self, *, select_id: str | None = None) -> None:
-        self.annotation_table.setRowCount(0)
-        if self.project is None:
-            return
-        self.annotation_table.setRowCount(len(self.project.annotations))
         selected_row = -1
-        for row, annotation in enumerate(self.project.annotations):
-            text_item = QTableWidgetItem(annotation.text)
-            text_item.setData(Qt.ItemDataRole.UserRole, annotation.id)
-            range_text = (
-                f"{_format_sample(annotation.start_sample, self.project.audio_info.sample_rate)} – "
-                f"{_format_sample(annotation.end_sample, self.project.audio_info.sample_rate)}"
-            )
-            self.annotation_table.setItem(row, 0, text_item)
-            self.annotation_table.setItem(row, 1, QTableWidgetItem(range_text))
-            state = QTableWidgetItem("需复核" if annotation.review_required else "已确认")
-            state.setForeground(
-                QColor(theme_color("accent" if annotation.review_required else "success"))
-            )
-            if annotation.review_required:
-                reason_text = "；".join(
-                    _REVIEW_REASON_LABELS.get(reason, reason)
-                    for reason in annotation.review_reasons
+        selected_annotation_id: str | None = None
+        # Rebuilding the table is an internal refresh, not a new user
+        # selection. Blocking currentCellChanged prevents a waveform edit from
+        # moving the transcript cursor or its scroll position on the left.
+        with QSignalBlocker(self.annotation_table):
+            self.annotation_table.setRowCount(0)
+            if self.project is None:
+                self._editing_annotation_id = None
+                return
+            self.annotation_table.setRowCount(len(self.project.annotations))
+            for row, annotation in enumerate(self.project.annotations):
+                text_item = QTableWidgetItem(annotation.text)
+                text_item.setData(Qt.ItemDataRole.UserRole, annotation.id)
+                range_text = (
+                    f"{_format_sample(annotation.start_sample, self.project.audio_info.sample_rate)} – "
+                    f"{_format_sample(annotation.end_sample, self.project.audio_info.sample_rate)}"
                 )
-                state.setToolTip(f"{reason_text}。试听后拖动边界，或点击“确认边界”。")
-            self.annotation_table.setItem(row, 2, state)
-            if annotation.id == select_id:
-                selected_row = row
+                self.annotation_table.setItem(row, 0, text_item)
+                self.annotation_table.setItem(row, 1, QTableWidgetItem(range_text))
+                state = QTableWidgetItem("需复核" if annotation.review_required else "已确认")
+                state.setForeground(
+                    QColor(theme_color("accent" if annotation.review_required else "success"))
+                )
+                if annotation.review_required:
+                    reason_text = "；".join(
+                        _REVIEW_REASON_LABELS.get(reason, reason)
+                        for reason in annotation.review_reasons
+                    )
+                    state.setToolTip(f"{reason_text}。试听后拖动边界，或点击“确认边界”。")
+                self.annotation_table.setItem(row, 2, state)
+                if annotation.id == select_id:
+                    selected_row = row
+                    selected_annotation_id = annotation.id
+            if selected_row >= 0:
+                self.annotation_table.selectRow(selected_row)
+            else:
+                self.annotation_table.clearSelection()
+        self._editing_annotation_id = selected_annotation_id
         self.annotation_summary.setText(f"{len(self.project.annotations)} 项")
-        if selected_row >= 0:
-            self.annotation_table.selectRow(selected_row)
         removed_samples = sum(
             item.end_sample - item.start_sample for item in self.project.deletion_intervals
         )
@@ -1027,8 +1444,15 @@ class AudioProcessingWidget(QWidget):
         menu = QMenu(self.transcript_edit)
         add_action = QAction("标注为删除", menu)
         add_action.setShortcut(QKeySequence("Ctrl+B"))
+        add_action.setEnabled(
+            self._selected_token_range() is not None and self._text_timestamps_ready()
+        )
         add_action.triggered.connect(self._add_delete_annotation)
         preview_action = QAction("试听选中文字", menu)
+        preview_action.setEnabled(
+            self._selected_token_range() is not None
+            and self._text_timestamps_ready()
+        )
         preview_action.triggered.connect(
             lambda: self._start_preview("selection", self.preview_text_button)
         )
@@ -1097,7 +1521,18 @@ class AudioProcessingWidget(QWidget):
         if self.project is None or self.tools is None or not self._preview_directory.isValid():
             return
         token_range = self._selected_token_range()
-        if token_range is not None and self.waveform_envelope is None:
+        if (
+            trigger_button is self.preview_text_button
+            and token_range is not None
+            and not self._text_timestamps_ready()
+        ):
+            self.statusMessage.emit("精确逐字对齐尚未完成，暂不能试听选中文字")
+            return
+        use_text_selection = token_range is not None and (
+            trigger_button is self.preview_text_button
+            or self.waveform_envelope is None
+        )
+        if use_text_selection:
             left, right = token_range
             start = self.project.tokens[left].start_sample
             end = self.project.tokens[right - 1].end_sample
@@ -1106,14 +1541,18 @@ class AudioProcessingWidget(QWidget):
         if end <= start:
             QMessageBox.information(self, "没有试听范围", "请先选择文字或在波形上框选范围。")
             return
-        self._player.stop()
-        self.statusMessage.emit("正在生成本地试听，不会上传音频…")
         if trigger_button is None:
             trigger_button = {
                 "original": self.preview_original_button,
                 "selection": self.preview_selection_button,
                 "edited": self.preview_edited_button,
             }.get(mode)
+        if self._player.is_active and trigger_button is self._active_preview_button:
+            self._stop_playback()
+            return
+        self._player.stop()
+        self.statusMessage.emit("正在生成本地试听，不会上传音频…")
+        preview_duration = _format_sample(end - start, self.project.audio_info.sample_rate)
         self._start_task(
             make_audio_processing_preview_operation(
                 self.project,
@@ -1123,12 +1562,23 @@ class AudioProcessingWidget(QWidget):
                 tools=self.tools,
                 preview_directory=self._preview_directory.path(),
             ),
-            lambda value: self._preview_ready(value, mode),
+            lambda value: self._preview_ready(
+                value,
+                mode,
+                preview_duration,
+                trigger_button,
+            ),
             show_progress=False,
             busy_button=trigger_button,
         )
 
-    def _preview_ready(self, value: object, mode: str) -> None:
+    def _preview_ready(
+        self,
+        value: object,
+        mode: str,
+        preview_duration: str,
+        trigger_button: QAbstractButton | None,
+    ) -> None:
         assert isinstance(value, CandidatePreviewResult)
         paths = {
             "original": value.original_wav_path,
@@ -1141,10 +1591,11 @@ class AudioProcessingWidget(QWidget):
         except AudioPlaybackError as exc:
             self._playback_failed(str(exc))
         else:
+            self._set_active_preview_button(trigger_button)
             messages = {
-                "original": "正在试听原音（删除范围前后各 3 秒）",
-                "selection": "正在试听将要删除的音频范围",
-                "edited": "正在试听删除后效果（删除范围前后各 3 秒）",
+                "original": f"正在试听原音（未剪；当前范围 {preview_duration}）",
+                "selection": f"正在试听将要删除的音频范围（{preview_duration}）",
+                "edited": f"正在试听删除后（已校验并移除当前范围 {preview_duration}）",
             }
             self.statusMessage.emit(messages[mode])
 
@@ -1176,13 +1627,20 @@ class AudioProcessingWidget(QWidget):
 
     def _export_ready(self, value: object) -> None:
         assert isinstance(value, AudioProcessingExportResult)
+        removed_duration = (
+            _format_sample(value.removed_samples, self.project.audio_info.sample_rate)
+            if self.project is not None
+            else f"{value.removed_samples} 个 PCM 样本"
+        )
         QMessageBox.information(
             self,
             "导出完成",
             f"已生成：\n{value.wav_path.name}\n{value.mp3_path.name}\n\n"
-            f"共删除 {value.removed_samples} 个 PCM 样本。",
+            f"已实际删除：{removed_duration}（{value.removed_samples} 个 PCM 样本）。",
         )
-        self.statusMessage.emit(f"音频处理导出完成：{value.wav_path.parent}")
+        self.statusMessage.emit(
+            f"音频处理导出完成：已实际删除 {removed_duration} · {value.wav_path.parent}"
+        )
 
     def _output_changed(self, value: str) -> None:
         if self.project is not None:
@@ -1256,16 +1714,53 @@ class AudioProcessingWidget(QWidget):
             self.statusMessage.emit(message)
 
     def _task_error(self, message: str) -> None:
+        if self._active_transcription_generation:
+            self._active_transcription_generation = 0
+            self._transcript_typewriter.stop()
+            if self.project is not None:
+                self._render_transcript()
+                self.summary_label.setText("识别失败，已恢复上次完整转写")
+            else:
+                self._transcript_typewriter.clear()
+                self.summary_label.setText("识别失败，可检查音频后重新开始")
         self.statusMessage.emit(f"操作失败：{message}")
         QMessageBox.warning(self, "操作失败", message)
 
     def _task_cancelled(self) -> None:
+        if self._active_transcription_generation:
+            self._active_transcription_generation = 0
+            self._transcript_typewriter.stop()
+            if self.project is not None:
+                self._render_transcript()
+            else:
+                self._transcript_typewriter.clear()
         self.summary_label.setText("操作已取消，可重新开始")
         self.statusMessage.emit("操作已取消")
 
     def _stop_playback(self) -> None:
         self._player.stop()
         self.statusMessage.emit("试听已停止")
+
+    def _playback_active_changed(self, active: bool) -> None:
+        if not active:
+            self._set_active_preview_button(None)
+        self._refresh_controls()
+
+    def _set_active_preview_button(
+        self,
+        button: QAbstractButton | None,
+    ) -> None:
+        previous = self._active_preview_button
+        if previous is button:
+            return
+        self._active_preview_button = button
+        for preview_button, playing in ((previous, False), (button, True)):
+            if preview_button is None:
+                continue
+            preview_button.setProperty("playing", playing)
+            preview_button.style().unpolish(preview_button)
+            preview_button.style().polish(preview_button)
+            preview_button.update()
 
     def _task_finished(self, task: BackgroundTask) -> None:
         if self._active_task is not task:
@@ -1279,9 +1774,15 @@ class AudioProcessingWidget(QWidget):
         self._refresh_controls()
 
     def _cancel_task(self) -> None:
+        if self._refinement_task is not None and self._active_task is None:
+            self.statusMessage.emit("正在取消后台逐字精修…")
+            self._cancel_refinement_task()
+            self._refresh_controls()
+            return
         if self._active_task is not None:
             self.task_progress.set_message("正在取消 · 若模型正在推理，将在当前片段结束后停止…")
             self.task_progress.set_cancel_enabled(False)
+            self._cancel_refinement_task()
             self._active_task.cancel()
 
     def _waveform_view_changed(self, start: int, end: int) -> None:
@@ -1303,25 +1804,35 @@ class AudioProcessingWidget(QWidget):
 
     def _refresh_controls(self) -> None:
         busy = self._active_task is not None
+        refinement_busy = self._refinement_task is not None
         self.import_view.set_busy(busy)
         ready = self.project is not None
         has_selection = self._selected_token_range() is not None if ready else False
         waveform_ready = self.waveform_envelope is not None
+        text_timestamps_ready = self._text_timestamps_ready()
+        refinement_pending = bool(ready and not text_timestamps_ready)
         self.audio_path_edit.setEnabled(not busy)
         self.audio_browse_button.setEnabled(not busy)
-        self.open_project_button.setEnabled(not busy)
-        self.task_progress.set_cancel_enabled(busy)
+        self.task_progress.set_cancel_enabled(busy or refinement_busy)
         audio_source = Path(self.audio_path_edit.text().strip()).expanduser()
         supported_audio = (
             audio_source.is_file() and audio_source.suffix.casefold() in _AUDIO_SUFFIXES
         )
         self.transcribe_button.setEnabled(not busy and supported_audio)
-        self.add_delete_button.setEnabled(not busy and ready and (has_selection or waveform_ready))
-        self.preview_text_button.setEnabled(not busy and ready and has_selection)
+        self.add_delete_button.setEnabled(
+            not busy
+            and ready
+            and (
+                (has_selection and text_timestamps_ready)
+                or (not has_selection and waveform_ready and not refinement_busy)
+            )
+        )
+        self.preview_text_button.setEnabled(
+            not busy and text_timestamps_ready and ready and has_selection
+        )
         self.preview_original_button.setEnabled(not busy and waveform_ready)
         self.preview_selection_button.setEnabled(not busy and waveform_ready)
         self.preview_edited_button.setEnabled(not busy and waveform_ready)
-        self.stop_button.setEnabled(self._player.is_active)
         self.remove_annotation_button.setEnabled(not busy and self._editing_annotation() is not None)
         editing_annotation = self._editing_annotation()
         self.confirm_boundary_button.setEnabled(
@@ -1333,15 +1844,39 @@ class AudioProcessingWidget(QWidget):
             ready and any(item.review_required for item in self.project.annotations)
         )
         self.export_button.setEnabled(
-            not busy and ready and bool(self.project.annotations) and not pending_review
+            not busy
+            and not refinement_pending
+            and ready
+            and bool(self.project.annotations)
+            and not pending_review
         )
-        self.export_button.setToolTip(
-            "请先确认所有待复核删除边界" if pending_review else "导出已确认的删除结果"
+        if pending_review:
+            self.export_button.setToolTip("请先确认所有待复核删除边界")
+        elif refinement_pending:
+            self.export_button.setToolTip("后台逐字时间戳细化完成后即可导出")
+        else:
+            self.export_button.setToolTip("导出已确认的删除结果")
+        if refinement_pending:
+            self.add_delete_button.setToolTip("精确逐字对齐完成后才能按文字建立标注")
+            self.preview_text_button.setToolTip("精确逐字对齐完成后才能试听选中文字")
+        else:
+            self.add_delete_button.setToolTip("")
+            self.preview_text_button.setToolTip("")
+
+    def _text_timestamps_ready(self) -> bool:
+        if self.project is None:
+            return False
+        return (
+            self.project.analysis_diagnostics.get("character_refinement_status")
+            == "completed"
         )
 
     def shutdown(self) -> None:
         self._player.stop()
         self._preview_spinner.stop()
+        self._active_transcription_generation = 0
+        self._transcript_typewriter.stop()
+        self._cancel_refinement_task()
         if self._active_task is not None:
             self._active_task.cancel()
         self._autosave()

@@ -42,43 +42,81 @@ class ImportLandingView(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(34, 30, 34, 34)
-        root.addStretch(1)
+        root.setContentsMargins(52, 28, 42, 18)
+        root.setSpacing(12)
 
-        surface = QWidget()
-        surface.setObjectName("importDropSurface")
-        surface.setMaximumWidth(880)
-        surface.setMinimumHeight(470)
-        surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.drop_surface = surface
-        content = QVBoxLayout(surface)
-        content.setContentsMargins(46, 42, 46, 38)
-        content.setSpacing(12)
-
-        icon = QLabel()
-        icon.setObjectName("importHeroIcon")
-        icon.setPixmap(ui_icon("upload").pixmap(QSize(58, 58)))
-        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content.addWidget(icon)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(36)
 
         word_mode = self.mode == "word"
+
+        intro = QWidget()
+        intro.setObjectName("importIntroPane")
+        intro.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        intro_content = QVBoxLayout(intro)
+        intro_content.setContentsMargins(0, 0, 0, 0)
+        intro_content.setSpacing(12)
+        intro_content.addStretch(2)
+
         kicker = QLabel("WORD WORKFLOW" if word_mode else "TRANSCRIPT EDITOR")
         kicker.setObjectName("importKicker")
-        kicker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        kicker.setAlignment(Qt.AlignmentFlag.AlignLeft)
         title = QLabel("拖入音频与标注文档" if word_mode else "拖入一段音频开始")
         title.setObjectName("importTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        title.setWordWrap(True)
         subtitle = QLabel(
             "同时拖入音频和 .docx，或分别选择文件"
             if word_mode
             else "导入后进入完整转写、波形标注与试听工作台"
         )
         subtitle.setObjectName("importSubtitle")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignLeft)
         subtitle.setWordWrap(True)
-        content.addWidget(kicker)
-        content.addWidget(title)
-        content.addWidget(subtitle)
+        privacy = QLabel("文件仅在本机处理\n安全 · 私密 · 高效")
+        privacy.setObjectName("importPrivacy")
+        privacy.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        privacy.setWordWrap(True)
+        intro_content.addWidget(kicker)
+        intro_content.addWidget(title)
+        intro_content.addWidget(subtitle)
+        intro_content.addSpacing(22)
+        local_row = QHBoxLayout()
+        local_row.setContentsMargins(0, 0, 0, 0)
+        local_row.setSpacing(10)
+        local_icon = QLabel()
+        local_icon.setObjectName("importPrivacyIcon")
+        local_icon.setPixmap(ui_icon("check").pixmap(QSize(24, 24)))
+        local_icon.setAlignment(Qt.AlignmentFlag.AlignTop)
+        local_row.addWidget(local_icon)
+        local_row.addWidget(privacy, 1)
+        intro_content.addLayout(local_row)
+        intro_content.addStretch(3)
+
+        surface = QWidget()
+        surface.setObjectName("importDropSurface")
+        surface.setMinimumSize(500, 430)
+        surface.setMaximumSize(740, 590)
+        surface.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        surface.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        surface.setAutoFillBackground(False)
+        self.drop_surface = surface
+        content = QVBoxLayout(surface)
+        content.setContentsMargins(52, 42, 52, 38)
+        content.setSpacing(12)
+        content.addStretch(1)
+
+        icon = QLabel()
+        icon.setObjectName("importHeroIcon")
+        icon.setPixmap(ui_icon("upload").pixmap(QSize(48, 48)))
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content.addWidget(icon)
+
+        drop_title = QLabel("拖放到这里")
+        drop_title.setObjectName("importDropTitle")
+        drop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content.addWidget(drop_title)
         content.addSpacing(12)
 
         file_row = QHBoxLayout()
@@ -108,31 +146,30 @@ class ImportLandingView(QWidget):
         formats.setObjectName("importFormats")
         formats.setAlignment(Qt.AlignmentFlag.AlignCenter)
         content.addWidget(formats)
-        content.addStretch(1)
+        content.addStretch(2)
 
-        project_button = QPushButton("打开已有项目")
-        project_button.setObjectName("importProjectButton")
-        project_button.setProperty("secondary", True)
-        set_button_icon(project_button, "project", size=17)
-        project_button.clicked.connect(lambda _checked=False: self.projectBrowseRequested.emit())
-        self.project_button = project_button
-        project_row = QHBoxLayout()
-        project_row.addStretch(1)
-        project_row.addWidget(project_button)
-        project_row.addStretch(1)
-        content.addLayout(project_row)
+        surface_column = QWidget()
+        surface_column.setObjectName("importDropColumn")
+        surface_column_layout = QVBoxLayout(surface_column)
+        surface_column_layout.setContentsMargins(0, 0, 0, 0)
+        surface_column_layout.setSpacing(0)
+        surface_column_layout.addStretch(1)
+        surface_column_layout.addWidget(surface)
+        surface_column_layout.addStretch(1)
 
-        privacy = QLabel("文件不会上传 · 识别与剪辑均在本机完成")
-        privacy.setObjectName("importPrivacy")
-        privacy.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content.addWidget(privacy)
+        body.addWidget(intro, 5)
+        body.addWidget(surface_column, 7)
+        root.addLayout(body, 1)
 
-        center = QHBoxLayout()
-        center.addStretch(1)
-        center.addWidget(surface, 8)
-        center.addStretch(1)
-        root.addLayout(center, 8)
-        root.addStretch(1)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 8, 0, 0)
+        footer.setSpacing(12)
+        footer.addStretch(1)
+        footer_privacy = QLabel("文件不会上传 · 识别与剪辑均在本机完成")
+        footer_privacy.setObjectName("importFooterPrivacy")
+        footer_privacy.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        footer.addWidget(footer_privacy)
+        root.addLayout(footer)
 
     def set_paths(self, audio_path: str = "", document_path: str = "") -> None:
         """Reflect selected inputs while the landing page remains visible."""
@@ -164,7 +201,7 @@ class ImportLandingView(QWidget):
         if invalid_audio or (self.mode == "word" and invalid_document):
             message = "文件不存在或格式不受支持"
         elif self.mode == "audio":
-            message = "音频已就绪" if audio_name else "可拖放文件到窗口任意位置"
+            message = "音频已就绪" if audio_name else ""
         elif audio_name and document_name:
             message = "音频与 Word 已就绪"
         elif audio_name:
@@ -172,11 +209,12 @@ class ImportLandingView(QWidget):
         elif document_name:
             message = "Word 已选择，还需要音频"
         else:
-            message = "可一次拖入两个文件"
+            message = ""
         self.state_label.setText(message)
+        self.state_label.setVisible(bool(message))
 
     def set_busy(self, busy: bool) -> None:
-        for button in (self.audio_button, self.document_button, self.project_button):
+        for button in (self.audio_button, self.document_button):
             if button is not None:
                 button.setEnabled(not busy)
 
@@ -230,8 +268,8 @@ class ImportLandingView(QWidget):
 def _file_button(icon_name: str, text: str) -> QPushButton:
     button = QPushButton(text)
     button.setObjectName("importFileButton")
-    button.setMinimumHeight(62)
-    set_button_icon(button, icon_name, size=23)
+    button.setMinimumHeight(56)
+    set_button_icon(button, icon_name, size=20)
     return button
 
 

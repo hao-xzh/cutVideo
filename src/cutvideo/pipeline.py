@@ -14,6 +14,8 @@ from .alignment import (
     BOUNDARY_REFINEMENT_UNCERTAIN,
     STATUS_NEEDS_REVIEW,
     AlignmentCandidate,
+    AsrAligner,
+    ForceAligner,
     FunASRAsrAligner,
     FunASRForceAligner,
     align_transcript,
@@ -95,12 +97,21 @@ def _model_record(resources: RuntimeResources, purpose: str, name: str) -> Model
 
 def _build_aligners(
     resources: RuntimeResources, warnings: list[str]
-) -> tuple[FunASRForceAligner | None, FunASRAsrAligner | None]:
+) -> tuple[ForceAligner | None, AsrAligner | None]:
     ffmpeg = resources.ffmpeg
-    force = None
-    asr = None
+    force: ForceAligner | None = None
+    asr: AsrAligner | None = None
+    if resources.has_qwen_models:
+        from .qwen_mlx import QwenMlxAsrAligner, QwenMlxForceAligner
+
+        assert resources.qwen_asr_model is not None
+        assert resources.qwen_force_model is not None
+        return (
+            QwenMlxForceAligner(resources.qwen_force_model, ffmpeg_path=ffmpeg),
+            QwenMlxAsrAligner(resources.qwen_asr_model, ffmpeg_path=ffmpeg),
+        )
     if resources.fa_model and ffmpeg:
-        force = FunASRForceAligner(resources.fa_model, ffmpeg_path=ffmpeg, device="cpu")
+        force = FunASRForceAligner(resources.fa_model, ffmpeg_path=ffmpeg)
     else:
         warnings.append("缺少 fa-zh，本次强制对齐将使用保守回退，所有切点都需要复核。")
     if resources.asr_model and resources.vad_model and ffmpeg:
@@ -108,7 +119,6 @@ def _build_aligners(
             resources.asr_model,
             resources.vad_model,
             ffmpeg_path=ffmpeg,
-            device="cpu",
         )
     else:
         warnings.append("缺少 paraformer-zh/fsmn-vad，无法建立整段真实语音时间线。")
@@ -247,14 +257,20 @@ def analyze_pair(
             f"正在按真实语音定位段落 {done}/{total}…",
         )
 
-    aligned = align_transcript(
-        parsed,
-        audio_info,
-        force_aligner,
-        asr_aligner,
-        progress_cb=alignment_progress,
-        cancel=cancel,
-    )
+    try:
+        aligned = align_transcript(
+            parsed,
+            audio_info,
+            force_aligner,
+            asr_aligner,
+            progress_cb=alignment_progress,
+            cancel=cancel,
+        )
+    finally:
+        for adapter in (force_aligner, asr_aligner):
+            release = getattr(adapter, "release", None)
+            if callable(release):
+                release()
     _refine_candidate_boundaries(
         aligned,
         audio_info,
@@ -279,6 +295,10 @@ def analyze_pair(
         ]
         stored.source_start_char = highlight.start
         stored.source_end_char = highlight.end
+        # All yellow highlights remain pending until a person explicitly
+        # confirms deletion or keeps the passage.
+        stored.review_required = True
+        stored.status = CandidateStatus.NEEDS_REVIEW
         candidates.append(stored)
 
     models: list[ModelInfo] = [
@@ -288,17 +308,35 @@ def analyze_pair(
             ALIGNMENT_PIPELINE_VERSION,
         )
     ]
-    if force_aligner:
-        models.append(_model_record(resource_set, "forced_alignment", "fa-zh"))
-    if asr_aligner:
+    if resource_set.has_qwen_models:
         models.append(
             _model_record(
                 resource_set,
                 "primary_recognition_timeline",
-                "paraformer-zh",
+                "qwen3-asr-0.6b-4bit",
             )
         )
-        models.append(_model_record(resource_set, "voice_activity_detection", "fsmn-vad"))
+        models.append(
+            _model_record(
+                resource_set,
+                "forced_alignment",
+                "qwen3-forced-aligner-0.6b-4bit",
+            )
+        )
+    else:
+        if force_aligner:
+            models.append(_model_record(resource_set, "forced_alignment", "fa-zh"))
+        if asr_aligner:
+            models.append(
+                _model_record(
+                    resource_set,
+                    "primary_recognition_timeline",
+                    "paraformer-zh",
+                )
+            )
+            models.append(
+                _model_record(resource_set, "voice_activity_detection", "fsmn-vad")
+            )
     project_audio = ProjectAudioInfo(
         sample_rate=audio_info.sample_rate,
         channels=audio_info.channels,

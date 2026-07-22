@@ -42,7 +42,7 @@ def make_icon_button(
     *,
     parent: QWidget | None = None,
     size: int = 32,
-    icon_size: int = 17,
+    icon_size: int = 16,
 ) -> QToolButton:
     """Return a compact icon-only button with a readable accessible name."""
 

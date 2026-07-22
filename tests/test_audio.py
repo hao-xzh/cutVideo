@@ -9,9 +9,11 @@ import numpy as np
 import pytest
 
 from cutvideo.audio import (
+    AudioInfo,
     CutInterval,
     build_waveform_envelopes,
     compute_waveform_envelope,
+    decode_f32,
     merge_intervals,
     probe_audio,
     refine_boundary,
@@ -28,6 +30,28 @@ def test_merge_intervals_sorts_clamps_and_joins_touching_ranges() -> None:
         (20, 40),
         (99, 100),
     ]
+
+
+def test_decode_f32_seeks_inside_uncompressed_wav(tmp_path: Path) -> None:
+    import wave
+
+    path = tmp_path / "clip.wav"
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16_000)
+        # 0..9 ascending so a mid-file seek can be checked exactly.
+        frames = np.arange(10, dtype=np.int16) * 1000
+        writer.writeframes(frames.tobytes())
+    info = AudioInfo(path, 16_000, 1, 10, 10 / 16_000, "pcm_s16le")
+
+    samples = decode_f32(path, info=info, start_sample=3, end_sample=7)
+
+    np.testing.assert_allclose(
+        samples.reshape(-1),
+        np.array([3, 4, 5, 6], dtype=np.float32) * 1000 / 32768.0,
+        atol=1e-6,
+    )
 
 
 def test_waveform_envelope_handles_partial_final_block_and_stereo() -> None:

@@ -1,0 +1,2 @@
+[console_scripts]
+mlx-qwen3-asr = mlx_qwen3_asr.cli:main

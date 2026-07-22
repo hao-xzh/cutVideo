@@ -12,6 +12,7 @@ import json
 import math
 import subprocess
 import tempfile
+import wave
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -227,6 +228,37 @@ def _decoded_byte_chunks(
             raise FFmpegProcessError(argv, returncode, error)
 
 
+def probe_audio_metadata(
+    path: str | Path,
+    *,
+    tools: FFmpegTools | None = None,
+    resource_root: str | Path | None = None,
+) -> AudioInfo:
+    """Read container metadata without decoding the complete audio stream.
+
+    ``total_samples`` is an estimate intended for low-latency task planning.
+    Persisted projects must still use :func:`probe_audio` or
+    :func:`probe_audio_with_waveform`, which count exact decoded frames.
+    """
+
+    audio_path = Path(path).expanduser().resolve()
+    if not audio_path.is_file():
+        raise FileNotFoundError(audio_path)
+    resolved_tools = _resolve_tools(tools, resource_root=resource_root)
+    sample_rate, channels, codec, duration = _probe_stream(audio_path, resolved_tools)
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f"audio stream duration is unavailable: {audio_path}")
+    total_samples = max(1, round(duration * sample_rate))
+    return AudioInfo(
+        path=audio_path,
+        sample_rate=sample_rate,
+        channels=channels,
+        total_samples=total_samples,
+        duration_seconds=duration,
+        codec=codec,
+    )
+
+
 def probe_audio(
     path: str | Path,
     *,
@@ -386,6 +418,14 @@ def decode_f32(
     start = max(0, int(start_sample))
     if end_sample is not None and int(end_sample) <= start:
         return np.empty((0, channels), dtype=np.float32)
+    wav_samples = _decode_wav_f32_range(
+        audio_path,
+        start_sample=start,
+        end_sample=None if end_sample is None else int(end_sample),
+        channels=channels,
+    )
+    if wav_samples is not None:
+        return wav_samples
     filter_text = f"atrim=start_sample={start}"
     if end_sample is not None:
         filter_text += f":end_sample={int(end_sample)}"
@@ -402,6 +442,52 @@ def decode_f32(
     if len(raw) % frame_bytes:
         raise ValueError("ffmpeg emitted a partial PCM frame")
     return np.frombuffer(raw, dtype="<f4").reshape((-1, channels)).copy()
+
+
+def _decode_wav_f32_range(
+    path: Path,
+    *,
+    start_sample: int,
+    end_sample: int | None,
+    channels: int,
+) -> np.ndarray | None:
+    """Seek inside an uncompressed WAV without re-decoding from sample 0."""
+
+    if path.suffix.casefold() != ".wav":
+        return None
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getcomptype() != "NONE" or reader.getnchannels() != channels:
+                return None
+            width = reader.getsampwidth()
+            total = reader.getnframes()
+            start = max(0, min(total, int(start_sample)))
+            end = total if end_sample is None else max(start, min(total, int(end_sample)))
+            if end <= start:
+                return np.empty((0, channels), dtype=np.float32)
+            reader.setpos(start)
+            raw = reader.readframes(end - start)
+    except (EOFError, OSError, wave.Error):
+        return None
+    if width == 2:
+        integers = np.frombuffer(raw, dtype="<i2")
+        frames = integers.astype(np.float32).reshape((-1, channels))
+        frames /= 32768.0
+        return frames.copy()
+    if width == 4:
+        floats = np.frombuffer(raw, dtype="<f4").reshape((-1, channels))
+        if np.isfinite(floats).all() and float(np.max(np.abs(floats), initial=0.0)) <= 8.0:
+            return floats.copy()
+        integers = np.frombuffer(raw, dtype="<i4")
+        frames = integers.astype(np.float32).reshape((-1, channels))
+        frames /= 2147483648.0
+        return frames.copy()
+    if width == 1:
+        integers = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        frames = (integers - 128.0).reshape((-1, channels))
+        frames /= 128.0
+        return frames.copy()
+    return None
 
 
 def _as_mono(samples: np.ndarray | Sequence[float]) -> np.ndarray:

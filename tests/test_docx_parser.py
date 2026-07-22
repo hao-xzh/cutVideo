@@ -68,7 +68,7 @@ def test_parses_strict_anchors_and_merges_adjacent_yellow_runs(tmp_path: Path) -
     assert transcript.highlighted_char_count == 5
 
 
-@pytest.mark.parametrize("anchor", ["发言人 0:01", "前缀 发言人 00:01", "发言人 00:60"])
+@pytest.mark.parametrize("anchor", ["发言人 0:1", "前缀 发言人 00:01", "发言人 00:60"])
 def test_rejects_documents_without_an_exact_anchor(tmp_path: Path, anchor: str) -> None:
     source = _write_docx(tmp_path / "invalid.docx", [[(anchor, None)], [("正文", None)]])
 

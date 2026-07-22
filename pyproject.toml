@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cutvideo-offline"
-version = "0.2.3"
+version = "0.2.5"
 description = "Offline DOCX-highlight driven audio editor for Windows and macOS"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
@@ -22,6 +22,9 @@ ml = [
   "torch>=2.5,<3",
   "torchaudio>=2.5,<3",
   "modelscope>=1.20,<2",
+  "mlx-qwen3-asr>=0.3.5,<0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx==0.29.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-metal==0.29.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 dev = [
   "pytest>=8.3,<9",

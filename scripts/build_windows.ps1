@@ -20,6 +20,15 @@ if ($AllowUnpinned) { $verifyArgs += "--allow-unpinned" }
 & $Python @verifyArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$ResourceStage = Join-Path $Root "build\resources-windows"
+if (Test-Path -LiteralPath $ResourceStage) {
+    Remove-Item -LiteralPath $ResourceStage -Recurse -Force
+}
+New-Item -ItemType Directory -Path $ResourceStage | Out-Null
+Copy-Item -Path "$Root\resources\*" -Destination $ResourceStage -Recurse -Force
+Remove-Item -LiteralPath (Join-Path $ResourceStage "models\qwen3-asr-0.6b-4bit") -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $ResourceStage "models\qwen3-forced-aligner-0.6b-4bit") -Recurse -Force -ErrorAction SilentlyContinue
+
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -42,7 +51,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     --exclude-module=pynndescent `
     --exclude-module=matplotlib `
     --exclude-module=cv2 `
-    --add-data="$Root\resources;resources" `
+    --add-data="$ResourceStage;resources" `
     --add-data="$Root\THIRD_PARTY_NOTICES.md;." `
     --add-data="$Root\README.md;." `
     --distpath="$DistPath" `
@@ -65,4 +74,5 @@ if ($selfTest.ExitCode -ne 0) {
 }
 Get-Content -LiteralPath $report -Encoding UTF8
 Remove-Item -LiteralPath $report -Force
+Remove-Item -LiteralPath $ResourceStage -Recurse -Force
 Write-Host "Standalone application created in $DistPath\CutVideo. Distribute the complete directory."

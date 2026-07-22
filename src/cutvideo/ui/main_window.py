@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import sys
 from collections import Counter
 from contextlib import suppress
 from pathlib import Path
@@ -17,6 +18,7 @@ from PySide6.QtCore import (
     QThreadPool,
     QTimer,
     QUrl,
+    Signal,
 )
 from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -44,6 +46,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -55,9 +58,11 @@ from ..project import CandidateStatus, CutCandidate, ProjectV1, save_project
 from ..resources import discover_resources
 from .audio_player import AudioPlaybackError, PcmWavPlayer
 from .audio_processing_widget import AudioProcessingWidget
+from .backdrop import ThemedBackdrop
 from .file_drop_edit import FileDropLineEdit
 from .icons import ButtonSpinner, make_icon_button, set_button_icon, ui_icon
 from .import_view import ImportLandingView
+from .macos_window import WindowDragRegion, make_titlebar_immersive
 from .progress_view import TaskProgressView
 from .settings import dialog_start, remember_dialog_path, remember_theme
 from .theme import (
@@ -67,10 +72,12 @@ from .theme import (
     stylesheet_for_theme,
     theme_color,
 )
+from .typewriter import TypewriterTextController
 from .usage_guide import UsageGuideDialog
 from .waveform import WaveformWidget
 from .workers import (
     AnalysisResult,
+    AsrTranscriptPartial,
     BackgroundTask,
     CandidatePreviewResult,
     ExportTaskResult,
@@ -81,6 +88,7 @@ from .workers import (
     make_load_project_operation,
     make_preflight_operation,
     make_preview_operation,
+    make_recognition_warmup_operation,
     make_relink_project_operation,
     make_waveform_operation,
 )
@@ -90,8 +98,8 @@ _AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
 _DOCUMENT_SUFFIXES = {".docx"}
 
 STATUS_LABELS = {
-    CandidateStatus.AUTO_APPROVED: "自动通过",
-    CandidateStatus.NEEDS_REVIEW: "需复核",
+    CandidateStatus.AUTO_APPROVED: "待确认",
+    CandidateStatus.NEEDS_REVIEW: "待确认",
     CandidateStatus.APPROVED: "已批准",
     CandidateStatus.SKIPPED: "已保留",
 }
@@ -121,10 +129,19 @@ REASON_LABELS = {
 class MainWindow(QMainWindow):
     """Chinese desktop UI for import, analysis, review and export."""
 
+    wordTranscriptPartial = Signal(int, object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("mainWindow")
-        self.setWindowTitle("CutVideo · 离线音频工作台")
+        if sys.platform == "darwin":
+            self.setWindowFlag(Qt.WindowType.ExpandedClientAreaHint, True)
+            self.setWindowFlag(Qt.WindowType.NoTitleBarBackgroundHint, True)
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_ContentsMarginsRespectsSafeArea,
+                False,
+            )
+        self.setWindowTitle("" if sys.platform == "darwin" else "CutVideo")
         self.resize(1360, 900)
         self.setMinimumSize(1100, 720)
 
@@ -132,6 +149,7 @@ class MainWindow(QMainWindow):
         self._active_task: BackgroundTask | None = None
         self._foreground_uses_progress = True
         self._preview_spinner = ButtonSpinner(self)
+        self._active_preview_button: QAbstractButton | None = None
         self._auxiliary_tasks: set[BackgroundTask] = set()
         self._preflight: PreflightResult | None = None
         self.project: ProjectV1 | None = None
@@ -151,7 +169,7 @@ class MainWindow(QMainWindow):
         self._audio_player = PcmWavPlayer(self)
         self._audio_player.finished.connect(self._playback_finished)
         self._audio_player.failed.connect(self._playback_failed)
-        self._audio_player.active_changed.connect(lambda _active: self._refresh_controls())
+        self._audio_player.active_changed.connect(self._playback_active_changed)
         self._preview_queue: list[str] = []
         self._preview_queue_active = False
         self._undo_history: list[dict[str, object]] = []
@@ -166,8 +184,16 @@ class MainWindow(QMainWindow):
         self._workspace_overlay: QLabel | None = None
         self._foreground_generation = 0
         self._source_generation = 0
+        self._word_transcription_generation = 0
+        self._active_word_transcription_generation = 0
+        self._model_warmup_started = False
+        self._macos_titlebar_configured = False
 
         self._build_ui()
+        self._word_transcript_typewriter = TypewriterTextController(
+            self.word_stream_edit,
+            self,
+        )
         self._connect_signals()
         self._install_shortcuts()
         self._set_step(1)
@@ -176,32 +202,67 @@ class MainWindow(QMainWindow):
         # Primary state is presented inline; a permanent bottom status strip
         # adds visual noise to the compact workstation layout.
         self.statusBar().hide()
+        QTimer.singleShot(0, self._configure_window_chrome)
+
+    def _configure_window_chrome(self) -> None:
+        if sys.platform != "darwin" or self._macos_titlebar_configured:
+            return
+        self._macos_titlebar_configured = make_titlebar_immersive(self)
+
+    def start_model_warmup(self) -> None:
+        """Prepare the shared local recognizer after the first window is visible."""
+
+        if self._model_warmup_started:
+            return
+        self._model_warmup_started = True
+
+        def begin() -> None:
+            self._start_auxiliary(
+                make_recognition_warmup_operation(),
+                lambda _ready: None,
+                report_errors=False,
+            )
+
+        QTimer.singleShot(250, begin)
 
     def _build_ui(self) -> None:
-        shell = QWidget(self)
-        shell.setObjectName("applicationShell")
+        shell = ThemedBackdrop(self)
+        self.application_shell = shell
         shell_layout = QHBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
 
         sidebar = QFrame(shell)
         sidebar.setObjectName("workspaceSidebar")
-        sidebar.setFixedWidth(88)
+        sidebar.setFixedWidth(132)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(10, 14, 10, 12)
+        sidebar_layout.setContentsMargins(
+            10,
+            40 if sys.platform == "darwin" else 14,
+            10,
+            12,
+        )
         sidebar_layout.setSpacing(8)
 
-        brand = QLabel(sidebar)
+        brand_row = QWidget(sidebar)
+        brand_row.setObjectName("sidebarBrand")
+        brand_layout = QHBoxLayout(brand_row)
+        brand_layout.setContentsMargins(8, 0, 6, 0)
+        brand_layout.setSpacing(8)
+        brand = QLabel(brand_row)
         brand.setObjectName("brandMark")
         application = QApplication.instance()
         brand_icon = application.windowIcon() if application is not None else ui_icon("cut-accent")
-        brand.setPixmap(brand_icon.pixmap(30, 30))
+        brand.setPixmap(brand_icon.pixmap(34, 34))
         brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand.setToolTip("CutVideo 离线音频工作台")
         brand.setAccessibleName("CutVideo")
-        brand.setFixedHeight(42)
-        sidebar_layout.addWidget(brand)
-        sidebar_layout.addSpacing(18)
+        brand.setFixedSize(44, 44)
+        brand_layout.addStretch(1)
+        brand_layout.addWidget(brand)
+        brand_layout.addStretch(1)
+        sidebar_layout.addWidget(brand_row)
+        sidebar_layout.addSpacing(12)
 
         self.workspace_navigation = QButtonGroup(self)
         self.workspace_navigation.setExclusive(True)
@@ -220,7 +281,32 @@ class MainWindow(QMainWindow):
         self.word_workspace_button.setChecked(True)
         sidebar_layout.addWidget(self.word_workspace_button)
         sidebar_layout.addWidget(self.audio_workspace_button)
+
+        self.help_button = make_icon_button(
+            "help",
+            "使用说明与快捷键（F1）",
+            size=32,
+        )
+        self.help_button.setObjectName("helpButton")
+        self.help_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_button = make_icon_button(
+            "sun",
+            "切换到明亮模式",
+            size=32,
+        )
+        self.theme_button.setObjectName("themeButton")
+        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_theme_button()
         sidebar_layout.addStretch(1)
+        sidebar_utility = QWidget(sidebar)
+        sidebar_utility.setObjectName("sidebarUtility")
+        sidebar_utility_layout = QHBoxLayout(sidebar_utility)
+        sidebar_utility_layout.setContentsMargins(4, 4, 4, 0)
+        sidebar_utility_layout.setSpacing(8)
+        sidebar_utility_layout.addWidget(self.help_button)
+        sidebar_utility_layout.addWidget(self.theme_button)
+        sidebar_utility_layout.addStretch(1)
+        sidebar_layout.addWidget(sidebar_utility)
         shell_layout.addWidget(sidebar)
 
         workspace_area = QWidget(shell)
@@ -229,32 +315,8 @@ class MainWindow(QMainWindow):
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(0)
 
-        self.help_button = make_icon_button(
-            "help",
-            "使用说明与快捷键（F1）",
-            size=34,
-        )
-        self.help_button.setObjectName("helpButton")
-        self.help_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.theme_button = make_icon_button(
-            "sun",
-            "切换到明亮模式",
-            size=34,
-        )
-        self.theme_button.setObjectName("themeButton")
-        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._update_theme_button()
-
-        utility_bar = QWidget(workspace_area)
-        utility_bar.setObjectName("utilityBar")
-        utility_bar.setFixedHeight(44)
-        utility_layout = QHBoxLayout(utility_bar)
-        utility_layout.setContentsMargins(0, 5, 12, 3)
-        utility_layout.setSpacing(2)
-        utility_layout.addStretch(1)
-        utility_layout.addWidget(self.help_button)
-        utility_layout.addWidget(self.theme_button)
-        workspace_layout.addWidget(utility_bar)
+        self.window_drag_region = WindowDragRegion(workspace_area)
+        workspace_layout.addWidget(self.window_drag_region)
 
         # Kept as ``workspace_tabs`` for compatibility with existing shortcuts/plugins.
         self.workspace_tabs = QStackedWidget(workspace_area)
@@ -278,82 +340,82 @@ class MainWindow(QMainWindow):
         central.setMinimumSize(940, 600)
         viewport.setWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(16, 8, 16, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         input_card = QFrame()
         input_card.setObjectName("inputCard")
-        input_layout = QVBoxLayout(input_card)
-        input_layout.setContentsMargins(12, 10, 12, 9)
+        input_layout = QHBoxLayout(input_card)
+        input_layout.setContentsMargins(18, 10, 18, 10)
         input_layout.setSpacing(8)
 
-        file_row = QHBoxLayout()
-        file_row.setSpacing(18)
-        audio_row = QHBoxLayout()
-        audio_row.setSpacing(8)
         audio_label = QLabel("音频")
         audio_label.setObjectName("fieldLabel")
-        audio_label.setFixedWidth(34)
+        audio_label.setFixedWidth(30)
         self.audio_path_edit = FileDropLineEdit((".mp3", ".wav", ".m4a", ".aac", ".flac"))
         self.audio_path_edit.setObjectName("audioPathEdit")
         self.audio_path_edit.setPlaceholderText("拖入音频，或点击右侧选择文件")
+        self.audio_path_edit.setMinimumWidth(150)
+        self.audio_path_edit.setMaximumWidth(320)
         self.audio_browse_button = make_icon_button(
             "folder-open",
             "选择音频文件",
+            size=32,
         )
         self.audio_browse_button.setObjectName("audioBrowseButton")
-        audio_row.addWidget(audio_label)
-        audio_row.addWidget(self.audio_path_edit, 1)
-        audio_row.addWidget(self.audio_browse_button)
-        file_row.addLayout(audio_row, 1)
+        input_layout.addWidget(audio_label)
+        input_layout.addWidget(self.audio_path_edit, 1)
+        input_layout.addWidget(self.audio_browse_button)
 
-        document_row = QHBoxLayout()
-        document_row.setSpacing(8)
         document_label = QLabel("Word")
         document_label.setObjectName("fieldLabel")
-        document_label.setFixedWidth(38)
+        document_label.setFixedWidth(34)
         self.docx_path_edit = FileDropLineEdit((".docx",))
         self.docx_path_edit.setObjectName("docxPathEdit")
         self.docx_path_edit.setPlaceholderText("拖入带黄色标记的 Word，或点击右侧选择文件")
+        self.docx_path_edit.setMinimumWidth(150)
+        self.docx_path_edit.setMaximumWidth(320)
         self.docx_browse_button = make_icon_button(
             "folder-open",
             "选择 Word 标注文档",
+            size=32,
         )
         self.docx_browse_button.setObjectName("docxBrowseButton")
-        document_row.addWidget(document_label)
-        document_row.addWidget(self.docx_path_edit, 1)
-        document_row.addWidget(self.docx_browse_button)
-        file_row.addLayout(document_row, 1)
-        input_layout.addLayout(file_row)
+        input_layout.addSpacing(4)
+        input_layout.addWidget(document_label)
+        input_layout.addWidget(self.docx_path_edit, 1)
+        input_layout.addWidget(self.docx_browse_button)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
         self.workflow_step_label = QLabel("输入准备")
         self.workflow_step_label.setObjectName("workflowStepLabel")
+        self.workflow_step_label.hide()
+        self.input_status_dot = QLabel("●")
+        self.input_status_dot.setObjectName("headerStatusDot")
+        self.input_status_dot.setFixedWidth(10)
         self.input_summary_label = QLabel("尚未预检")
-        self.input_summary_label.setObjectName("mutedLabel")
-        self.input_summary_label.setWordWrap(True)
-        action_row.addWidget(self.workflow_step_label)
-        action_row.addWidget(self.input_summary_label, 1)
+        self.input_summary_label.setObjectName("headerStatus")
+        self.input_summary_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.input_summary_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.input_summary_label.setMinimumWidth(140)
+        self.input_summary_label.setMaximumWidth(260)
 
-        self.open_project_button = QPushButton("打开项目…")
-        self.open_project_button.setObjectName("openProjectButton")
-        self.open_project_button.setProperty("secondary", True)
-        self.open_project_button.setMinimumWidth(112)
-        set_button_icon(self.open_project_button, "project")
         self.preflight_button = QPushButton("开始预检")
         self.preflight_button.setObjectName("preflightButton")
-        self.preflight_button.setMinimumWidth(106)
-        set_button_icon(self.preflight_button, "check")
+        self.preflight_button.setMinimumWidth(84)
+        set_button_icon(self.preflight_button, "check", size=16)
         self.analyze_button = QPushButton("自动分析")
         self.analyze_button.setObjectName("analyzeButton")
         self.analyze_button.setProperty("primary", True)
-        self.analyze_button.setMinimumWidth(110)
-        set_button_icon(self.analyze_button, "audio-primary")
-        action_row.addWidget(self.open_project_button)
-        action_row.addWidget(self.preflight_button)
-        action_row.addWidget(self.analyze_button)
-        input_layout.addLayout(action_row)
+        self.analyze_button.setMinimumWidth(92)
+        set_button_icon(self.analyze_button, "audio-primary", size=16)
+        input_layout.addWidget(self.preflight_button)
+        input_layout.addWidget(self.analyze_button)
+        input_layout.addSpacing(4)
+        input_layout.addWidget(self.input_status_dot)
+        input_layout.addWidget(self.input_summary_label)
         root.addWidget(input_card)
 
         self.task_progress = TaskProgressView()
@@ -363,24 +425,52 @@ class MainWindow(QMainWindow):
         self.cancel_button = self.task_progress.cancel_button
         root.addWidget(self.task_progress)
 
+        self.word_stream_card = QFrame()
+        self.word_stream_card.setObjectName("transcriptPane")
+        word_stream_layout = QVBoxLayout(self.word_stream_card)
+        word_stream_layout.setContentsMargins(0, 0, 0, 10)
+        word_stream_layout.setSpacing(8)
+        word_stream_heading = QHBoxLayout()
+        word_stream_title = QLabel("实时识别")
+        word_stream_title.setObjectName("sectionTitle")
+        self.word_stream_summary = QLabel("等待开始")
+        self.word_stream_summary.setObjectName("mutedLabel")
+        word_stream_heading.addWidget(word_stream_title)
+        word_stream_heading.addStretch(1)
+        word_stream_heading.addWidget(self.word_stream_summary)
+        word_stream_layout.addLayout(word_stream_heading)
+        self.word_stream_edit = QTextEdit()
+        self.word_stream_edit.setObjectName("wordStreamingTranscriptEdit")
+        self.word_stream_edit.setReadOnly(True)
+        self.word_stream_edit.setAcceptRichText(False)
+        self.word_stream_edit.setMinimumHeight(160)
+        self.word_stream_edit.setMaximumHeight(250)
+        self.word_stream_edit.setPlaceholderText(
+            "自动分析开始后，真实识别文字会从前到后持续显示"
+        )
+        word_stream_layout.addWidget(self.word_stream_edit)
+        self.word_stream_card.hide()
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("reviewSplitter")
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(8)
+        splitter.setHandleWidth(10)
 
         list_card = QFrame()
         list_card.setObjectName("reviewCard")
         list_layout = QVBoxLayout(list_card)
-        list_layout.setContentsMargins(10, 9, 10, 10)
-        list_layout.setSpacing(8)
+        list_layout.setContentsMargins(14, 12, 14, 12)
+        list_layout.setSpacing(10)
+        list_layout.addWidget(self.word_stream_card)
         list_heading = QHBoxLayout()
+        list_heading.setSpacing(8)
         list_title = QLabel("候选切点")
         list_title.setObjectName("sectionTitle")
         self.review_summary_label = QLabel("等待分析")
         self.review_summary_label.setObjectName("mutedLabel")
         self.candidate_filter = QComboBox()
         self.candidate_filter.setObjectName("candidateFilter")
-        self.candidate_filter.addItems(["全部切点", "仅需复核", "仅已删除", "仅已保留"])
+        self.candidate_filter.addItems(["全部标记", "仅待确认", "仅已删除", "仅已保留"])
         list_heading.addWidget(list_title)
         list_heading.addStretch(1)
         list_heading.addWidget(self.candidate_filter)
@@ -392,25 +482,35 @@ class MainWindow(QMainWindow):
             ["文字", "段落", "时间", "置信度", "状态", "原因"]
         )
         self.candidate_table.setAlternatingRowColors(True)
+        self.candidate_table.setShowGrid(False)
         self.candidate_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.candidate_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.candidate_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.candidate_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.candidate_table.verticalHeader().setVisible(False)
+        self.candidate_table.verticalHeader().setDefaultSectionSize(34)
         header_view = self.candidate_table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setHighlightSections(False)
+        header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        # Keep the complete six-column data contract while presenting the
+        # compact media-list composition from the visual target.
+        self.candidate_table.setColumnHidden(1, True)
+        self.candidate_table.setColumnHidden(3, True)
+        self.candidate_table.setColumnHidden(5, True)
         list_layout.addWidget(self.candidate_table, 1)
         splitter.addWidget(list_card)
 
         detail_card = QFrame()
         detail_card.setObjectName("reviewCard")
         detail_layout = QVBoxLayout(detail_card)
-        detail_layout.setContentsMargins(10, 9, 10, 10)
-        detail_layout.setSpacing(9)
+        detail_layout.setContentsMargins(14, 16, 14, 16)
+        detail_layout.setSpacing(10)
         detail_title = QLabel("切点复核")
         detail_title.setObjectName("sectionTitle")
         detail_layout.addWidget(detail_title)
@@ -427,7 +527,7 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self.waveform, 1)
 
         waveform_view_layout = QHBoxLayout()
-        waveform_view_layout.setSpacing(7)
+        waveform_view_layout.setSpacing(6)
         waveform_view_layout.addWidget(QLabel("视野"))
         self.waveform_scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.waveform_scrollbar.setObjectName("waveformScrollBar")
@@ -438,16 +538,19 @@ class MainWindow(QMainWindow):
         self.waveform_zoom_out_button = make_icon_button(
             "zoom-out",
             "缩小波形视野",
+            size=30,
         )
         self.waveform_zoom_out_button.setObjectName("waveformZoomOutButton")
         self.waveform_zoom_in_button = make_icon_button(
             "zoom-in",
             "放大波形以精调切点",
+            size=30,
         )
         self.waveform_zoom_in_button.setObjectName("waveformZoomInButton")
         self.waveform_focus_button = make_icon_button(
             "focus",
             "定位当前切点",
+            size=30,
         )
         self.waveform_focus_button.setObjectName("waveformFocusButton")
         waveform_view_layout.addWidget(self.waveform_zoom_out_button)
@@ -456,7 +559,8 @@ class MainWindow(QMainWindow):
         detail_layout.addLayout(waveform_view_layout)
 
         boundary_layout = QGridLayout()
-        boundary_layout.setHorizontalSpacing(9)
+        boundary_layout.setHorizontalSpacing(10)
+        boundary_layout.setVerticalSpacing(6)
         self.start_spin = _make_time_spin("startTimeSpin")
         self.end_spin = _make_time_spin("endTimeSpin")
         boundary_layout.addWidget(QLabel("开始切点"), 0, 0)
@@ -477,50 +581,62 @@ class MainWindow(QMainWindow):
         end_controls.addWidget(self.end_minus_button)
         end_controls.addWidget(self.end_plus_button)
         boundary_layout.addLayout(end_controls, 1, 1)
-        detail_layout.addLayout(boundary_layout)
+        detail_layout.insertLayout(3, boundary_layout)
 
         preview_layout = QHBoxLayout()
+        preview_layout.setSpacing(8)
         self.preview_original_button = QPushButton("听原句")
         self.preview_original_button.setObjectName("previewOriginalButton")
-        set_button_icon(self.preview_original_button, "play")
+        self.preview_original_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_original_button, "play", size=15)
+        self.preview_original_button.setToolTip("试听原句上下文；再次点击停止")
         self.preview_selection_button = QPushButton("只听待删")
         self.preview_selection_button.setObjectName("previewSelectionButton")
-        set_button_icon(self.preview_selection_button, "play")
+        self.preview_selection_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_selection_button, "play", size=15)
+        self.preview_selection_button.setToolTip("只试听当前待删除内容；再次点击停止")
         self.preview_edited_button = QPushButton("听剪后")
         self.preview_edited_button.setObjectName("previewEditedButton")
-        set_button_icon(self.preview_edited_button, "play")
-        self.stop_preview_button = make_icon_button("stop", "停止试听")
-        self.stop_preview_button.setObjectName("stopPreviewButton")
-        preview_layout.addWidget(self.preview_original_button)
-        preview_layout.addWidget(self.preview_selection_button)
-        preview_layout.addWidget(self.preview_edited_button)
-        preview_layout.addWidget(self.stop_preview_button)
-        preview_layout.addStretch(1)
-        detail_layout.addLayout(preview_layout)
-
-        review_actions = QHBoxLayout()
-        self.reset_button = QPushButton("恢复建议")
-        self.reset_button.setObjectName("resetCandidateButton")
-        set_button_icon(self.reset_button, "reset")
+        self.preview_edited_button.setProperty("previewAction", True)
+        set_button_icon(self.preview_edited_button, "play", size=15)
+        self.preview_edited_button.setToolTip("试听删除后的衔接效果；再次点击停止")
         self.skip_button = QPushButton("保留此处")
         self.skip_button.setObjectName("skipCandidateButton")
         self.approve_button = QPushButton("确认删除")
         self.approve_button.setObjectName("approveCandidateButton")
         self.approve_button.setProperty("primary", True)
-        set_button_icon(self.approve_button, "delete")
-        review_actions.addWidget(self.reset_button)
-        review_actions.addStretch(1)
-        review_actions.addWidget(self.skip_button)
-        review_actions.addWidget(self.approve_button)
-        detail_layout.addLayout(review_actions)
-        splitter.addWidget(detail_card)
+        set_button_icon(self.approve_button, "delete", size=15)
+        preview_label = QLabel("试听对比")
+        preview_label.setObjectName("controlCaption")
+        preview_group = QFrame()
+        preview_group.setObjectName("previewControlGroup")
+        preview_group_layout = QHBoxLayout(preview_group)
+        preview_group_layout.setContentsMargins(2, 2, 2, 2)
+        preview_group_layout.setSpacing(1)
+        preview_group_layout.addWidget(self.preview_original_button)
+        preview_group_layout.addWidget(self.preview_selection_button)
+        preview_group_layout.addWidget(self.preview_edited_button)
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_group)
+        preview_layout.addStretch(1)
+        preview_layout.addWidget(self.skip_button)
+        preview_layout.addWidget(self.approve_button)
+        detail_layout.addLayout(preview_layout)
+        detail_inset = QWidget()
+        detail_inset.setObjectName("rightWorkspaceInset")
+        detail_inset_layout = QVBoxLayout(detail_inset)
+        detail_inset_layout.setContentsMargins(0, 8, 0, 8)
+        detail_inset_layout.setSpacing(0)
+        detail_inset_layout.addWidget(detail_card)
+        splitter.addWidget(detail_inset)
         splitter.setSizes([500, 820])
         root.addWidget(splitter, 1)
 
         export_card = QFrame()
         export_card.setObjectName("exportCard")
         export_layout = QHBoxLayout(export_card)
-        export_layout.setContentsMargins(12, 8, 12, 8)
+        export_layout.setContentsMargins(14, 10, 14, 10)
+        export_layout.setSpacing(8)
         export_title = QLabel("导出位置")
         export_title.setObjectName("sectionTitle")
         self.output_path_edit = QLineEdit()
@@ -529,16 +645,18 @@ class MainWindow(QMainWindow):
         self.output_browse_button = make_icon_button(
             "folder-open",
             "选择导出目录",
+            size=32,
         )
         self.output_browse_button.setObjectName("outputBrowseButton")
         self.review_all_button = QPushButton("顺序试听已批准切点")
         self.review_all_button.setObjectName("reviewAllButton")
-        set_button_icon(self.review_all_button, "play")
+        self.review_all_button.setProperty("secondary", True)
+        set_button_icon(self.review_all_button, "play", size=15)
         self.export_button = QPushButton("导出 WAV + MP3")
         self.export_button.setObjectName("exportButton")
         self.export_button.setProperty("primary", True)
-        set_button_icon(self.export_button, "export")
-        self.export_button.setMinimumWidth(150)
+        set_button_icon(self.export_button, "export", size=15)
+        self.export_button.setMinimumWidth(140)
         export_layout.addWidget(export_title)
         export_layout.addWidget(self.output_path_edit, 1)
         export_layout.addWidget(self.output_browse_button)
@@ -563,7 +681,6 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.word_import_view.audioBrowseRequested.connect(self._choose_audio)
         self.word_import_view.documentBrowseRequested.connect(self._choose_document)
-        self.word_import_view.projectBrowseRequested.connect(self._choose_project)
         self.word_import_view.audioDropped.connect(self._set_imported_audio)
         self.word_import_view.documentDropped.connect(self._set_imported_document)
         self.audio_browse_button.clicked.connect(self._choose_audio)
@@ -575,9 +692,9 @@ class MainWindow(QMainWindow):
             lambda path: self.statusBar().showMessage(f"已拖入 Word：{Path(path).name}")
         )
         self.output_browse_button.clicked.connect(self._choose_output_directory)
-        self.open_project_button.clicked.connect(self._choose_project)
         self.preflight_button.clicked.connect(self._start_preflight)
         self.analyze_button.clicked.connect(self._start_analysis)
+        self.wordTranscriptPartial.connect(self._word_transcript_partial_ready)
         self.task_progress.cancelRequested.connect(self._cancel_active_task)
         self.candidate_table.currentCellChanged.connect(self._candidate_row_changed)
         self.candidate_filter.currentIndexChanged.connect(self._apply_candidate_filter)
@@ -598,7 +715,6 @@ class MainWindow(QMainWindow):
         self.end_plus_button.clicked.connect(lambda: self._nudge_boundary("end", 20.0))
         self.approve_button.clicked.connect(self._approve_candidate)
         self.skip_button.clicked.connect(self._skip_candidate)
-        self.reset_button.clicked.connect(self._reset_candidate)
         self.preview_original_button.clicked.connect(
             lambda: self._start_preview("original", trigger_button=self.preview_original_button)
         )
@@ -611,7 +727,6 @@ class MainWindow(QMainWindow):
         self.preview_edited_button.clicked.connect(
             lambda: self._start_preview("edited", trigger_button=self.preview_edited_button)
         )
-        self.stop_preview_button.clicked.connect(lambda: self._stop_preview())
         self.review_all_button.clicked.connect(self._start_review_all)
         self.export_button.clicked.connect(self._start_export)
         self.audio_path_edit.textChanged.connect(self._inputs_changed)
@@ -631,8 +746,6 @@ class MainWindow(QMainWindow):
             "Ctrl+Return": self._approve_candidate,
             "Ctrl+K": self._skip_candidate,
             "Meta+K": self._skip_candidate,
-            "Ctrl+R": self._reset_candidate,
-            "Meta+R": self._reset_candidate,
             "J": lambda: self._move_candidate(1),
             "K": lambda: self._move_candidate(-1),
             "Ctrl+Z": self._undo_edit,
@@ -737,6 +850,7 @@ class MainWindow(QMainWindow):
         self.theme_button.setEnabled(True)
 
     def _refresh_theme_colors(self) -> None:
+        self.application_shell.refresh_theme()
         if self.project is not None and self.audio_info is not None:
             for row, candidate in enumerate(self.project.candidates):
                 self._update_candidate_row(row, candidate)
@@ -877,7 +991,9 @@ class MainWindow(QMainWindow):
             tooltip="完整转写与音频处理工作区",
         )
         if index == 1:
-            self.statusBar().showMessage("音频处理 · 拖入一段音频，完整识别后可选择文字或框选波形")
+            self.statusBar().showMessage(
+                "音频处理 · 拖入一段音频，连续识别时文字会持续显示"
+            )
         elif self.project is not None:
             self.statusBar().showMessage("Word 黄标剪辑 · 项目已就绪")
         else:
@@ -928,6 +1044,7 @@ class MainWindow(QMainWindow):
             self.open_project(path)
 
     def open_project(self, path: str) -> None:
+        self._reset_word_stream_preview()
         self._sync_word_workspace_page(force_editor=True)
         self._start_foreground(
             make_load_project_operation(path),
@@ -935,9 +1052,16 @@ class MainWindow(QMainWindow):
             "正在打开项目…",
         )
 
+    def _reset_word_stream_preview(self) -> None:
+        self._active_word_transcription_generation = 0
+        self._word_transcript_typewriter.clear()
+        self.word_stream_summary.setText("等待开始")
+        self.word_stream_card.hide()
+
     def _inputs_changed(self) -> None:
         if self._setting_paths:
             return
+        self._reset_word_stream_preview()
         self._foreground_generation += 1
         self._source_generation += 1
         if self._active_task is not None:
@@ -975,6 +1099,7 @@ class MainWindow(QMainWindow):
     def _start_preflight(self) -> None:
         audio = self.audio_path_edit.text().strip()
         document = self.docx_path_edit.text().strip()
+        self._reset_word_stream_preview()
         self._start_foreground(
             make_preflight_operation(audio, document),
             self._preflight_completed,
@@ -1013,18 +1138,58 @@ class MainWindow(QMainWindow):
         self._refresh_controls()
 
     def _start_analysis(self) -> None:
-        if self._preflight is None:
+        if self._preflight is None or self._active_task is not None:
             return
         self._set_step(2)
+        self._word_transcription_generation += 1
+        generation = self._word_transcription_generation
+        self._active_word_transcription_generation = generation
+        self.word_stream_card.show()
+        self.word_stream_summary.setText("正在启动连续识别…")
+        self._word_transcript_typewriter.start(
+            "正在启动本地连续识别，真实文字会从前到后持续显示…"
+        )
         self._start_foreground(
-            make_analysis_operation(self._preflight),
+            make_analysis_operation(
+                self._preflight,
+                partial_cb=lambda partial: self.wordTranscriptPartial.emit(
+                    generation,
+                    partial,
+                ),
+            ),
             self._analysis_completed,
-            "正在分析，请保持程序运行…",
+            "正在连续识别并匹配 Word，请保持程序运行…",
+        )
+
+    def _word_transcript_partial_ready(self, generation: int, value: object) -> None:
+        if generation != self._active_word_transcription_generation:
+            return
+        assert isinstance(value, AsrTranscriptPartial)
+        self._word_transcript_typewriter.append_text(value.delta_text)
+        self.word_stream_summary.setText(
+            f"{value.sequence}/{value.total_sequences} 段 · "
+            f"已输出 {value.token_count} 个文字 · "
+            f"{value.committed_until_ms / 1000:.1f}/{value.total_duration_ms / 1000:.1f} 秒"
+        )
+        self.statusBar().showMessage(
+            f"Word 连续识别 {value.sequence}/{value.total_sequences}："
+            f"已输出 {value.token_count} 个文字"
         )
 
     def _analysis_completed(self, result: object) -> None:
         assert isinstance(result, AnalysisResult)
         assert self._preflight is not None
+        self._active_word_transcription_generation = 0
+        if result.recognized_text:
+            self._word_transcript_typewriter.replace_text(result.recognized_text)
+            self.word_stream_summary.setText(
+                f"识别完成 · {len(result.recognized_text)} 个文字 · 可开始复核切点"
+            )
+        else:
+            # A model failure after one or more windows must not leave a
+            # partial draft looking like the authoritative complete result.
+            self._word_transcript_typewriter.clear()
+            self.word_stream_summary.setText("连续识别未完整完成 · 切点均需人工复核")
         self._accept_project(
             result.project,
             result.project_path,
@@ -1036,7 +1201,7 @@ class MainWindow(QMainWindow):
         )
         unresolved = len(result.project.unresolved_candidates)
         diagnostics = (
-            f"分析完成 · {len(result.project.candidates)} 个切点 · {unresolved} 个需复核"
+            f"分析完成 · {len(result.project.candidates)} 处标记 · {unresolved} 处待人工确认"
         )
         fallback_count = reason_counts.get("document_time_search_fallback", 0)
         local_failure_count = reason_counts.get(
@@ -1240,15 +1405,14 @@ class MainWindow(QMainWindow):
             item.setText(value)
             item.setToolTip(value)
             if column == 4:
+                # Resolve-like status: color the text only, keep the media-list clean.
+                item.setData(Qt.ItemDataRole.BackgroundRole, None)
                 if candidate.needs_review:
                     item.setForeground(QColor(theme_color("accent")))
-                    item.setBackground(QColor(theme_color("accent_soft")))
                 elif candidate.status is CandidateStatus.SKIPPED:
                     item.setForeground(QColor(theme_color("status_neutral_text")))
-                    item.setBackground(QColor(theme_color("status_neutral_bg")))
                 else:
                     item.setForeground(QColor(theme_color("success")))
-                    item.setBackground(QColor(theme_color("success_soft")))
 
     def _candidate_row_changed(
         self,
@@ -1420,16 +1584,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已保留：{candidate.text}")
         self._candidate_status_changed(advance=True)
 
-    def _reset_candidate(self) -> None:
-        candidate = self._current_candidate()
-        if candidate is None:
-            return
-        self._record_edit_baseline()
-        candidate.reset()
-        self.statusBar().showMessage(f"已恢复建议切点：{candidate.text}")
-        self._candidate_status_changed(advance=False)
-        self._show_selected_candidate(center=True)
-
     def _candidate_status_changed(self, *, advance: bool) -> None:
         candidate = self._current_candidate()
         if candidate is None:
@@ -1475,11 +1629,11 @@ class MainWindow(QMainWindow):
         )
         if unresolved:
             self.review_summary_label.setText(
-                f"{total} 项 · {unresolved} 待复核 · {selected} 已删除 · {removed_text}"
+                f"{total} 处标记 · {unresolved} 待确认 · {selected} 已删除 · {removed_text}"
             )
         else:
             self.review_summary_label.setText(
-                f"{total} 项 · 已全部处理 · 删除 {selected} 项 / {removed_text}"
+                f"{total} 处标记 · 已全部确认 · 删除 {selected} 处 / {removed_text}"
             )
 
     def _start_preview(
@@ -1503,8 +1657,6 @@ class MainWindow(QMainWindow):
             or not self._preview_directory.isValid()
         ):
             return
-        self._stop_preview(clear_queue=candidate_id is None)
-        output = Path(self._preview_directory.path())
         if trigger_button is None:
             trigger_button = (
                 self.review_all_button
@@ -1515,6 +1667,15 @@ class MainWindow(QMainWindow):
                     "edited": self.preview_edited_button,
                 }.get(mode)
             )
+        if self._audio_player.is_active and trigger_button is self._active_preview_button:
+            self._stop_preview()
+            return
+        cut_duration = _format_ms(
+            candidate.effective_end_sample - candidate.effective_start_sample,
+            self.audio_info.sample_rate,
+        )
+        self._stop_preview(clear_queue=candidate_id is None)
+        output = Path(self._preview_directory.path())
 
         def completed(value: object) -> None:
             assert isinstance(value, CandidatePreviewResult)
@@ -1523,7 +1684,13 @@ class MainWindow(QMainWindow):
                 "selection": value.selection_wav_path,
                 "edited": value.edited_wav_path,
             }
-            self._play_file(paths[mode])
+            messages = {
+                "original": f"正在试听原句（未剪；当前待删 {cut_duration}）",
+                "selection": f"正在试听待删片段（{cut_duration}）",
+                "edited": f"正在试听剪后（已校验并移除当前待删 {cut_duration}）",
+            }
+            if self._play_file(paths[mode], status_message=messages[mode]):
+                self._set_active_preview_button(trigger_button)
 
         self._start_foreground(
             make_preview_operation(
@@ -1542,6 +1709,12 @@ class MainWindow(QMainWindow):
 
     def _start_review_all(self) -> None:
         if self.project is None:
+            return
+        if self._preview_queue_active or (
+            self._audio_player.is_active
+            and self._active_preview_button is self.review_all_button
+        ):
+            self._stop_preview()
             return
         self._stop_preview()
         self._preview_queue = [candidate.id for candidate in self.project.selected_candidates]
@@ -1578,15 +1751,37 @@ class MainWindow(QMainWindow):
             trigger_button=self.review_all_button,
         )
 
-    def _play_file(self, path: Path) -> None:
+    def _play_file(self, path: Path, *, status_message: str | None = None) -> bool:
         try:
             self._audio_player.play(path)
         except AudioPlaybackError as exc:
             QMessageBox.warning(self, "无法试听", str(exc))
             self._preview_queue_active = False
             self._preview_queue.clear()
+            return False
+        self.statusBar().showMessage(status_message or f"正在试听：{path.name}")
+        return True
+
+    def _playback_active_changed(self, active: bool) -> None:
+        if not active:
+            self._set_active_preview_button(None)
+        self._refresh_controls()
+
+    def _set_active_preview_button(
+        self,
+        button: QAbstractButton | None,
+    ) -> None:
+        previous = self._active_preview_button
+        if previous is button:
             return
-        self.statusBar().showMessage(f"正在试听：{path.name}")
+        self._active_preview_button = button
+        for preview_button, playing in ((previous, False), (button, True)):
+            if preview_button is None:
+                continue
+            preview_button.setProperty("playing", playing)
+            preview_button.style().unpolish(preview_button)
+            preview_button.style().polish(preview_button)
+            preview_button.update()
 
     def _playback_finished(self) -> None:
         if self._preview_queue_active:
@@ -1629,8 +1824,16 @@ class MainWindow(QMainWindow):
     def _export_completed(self, result: object) -> None:
         assert isinstance(result, ExportTaskResult)
         self._set_step(5)
-        self.statusBar().showMessage(f"导出完成：{result.wav_path.parent}")
+        removed_duration = (
+            _format_ms(result.removed_samples, self.project.audio_info.sample_rate)
+            if self.project is not None
+            else f"{result.removed_samples} 个 PCM 样本"
+        )
+        self.statusBar().showMessage(
+            f"导出完成：已实际删除 {removed_duration} · {result.wav_path.parent}"
+        )
         message = (
+            f"已实际删除：{removed_duration}\n\n"
             f"已生成：\n{result.wav_path.name}\n{result.mp3_path.name}\n"
             f"{result.csv_path.name}\n{result.project_path.name}"
         )
@@ -1733,12 +1936,20 @@ class MainWindow(QMainWindow):
         self.task_progress.set_progress(value, message)
 
     def _task_error(self, message: str) -> None:
+        if self._active_word_transcription_generation:
+            self._active_word_transcription_generation = 0
+            self._word_transcript_typewriter.stop()
+            self.word_stream_summary.setText("识别失败 · 当前显示为未完成草稿")
         self._preview_queue_active = False
         self._preview_queue.clear()
         self.statusBar().showMessage("操作失败")
         QMessageBox.critical(self, "操作失败", message)
 
     def _task_cancelled(self) -> None:
+        if self._active_word_transcription_generation:
+            self._active_word_transcription_generation = 0
+            self._word_transcript_typewriter.stop()
+            self.word_stream_summary.setText("识别已取消 · 当前显示为未完成草稿")
         self._preview_queue_active = False
         self._preview_queue.clear()
         self.statusBar().showMessage("操作已取消")
@@ -1781,7 +1992,6 @@ class MainWindow(QMainWindow):
         self.docx_path_edit.setEnabled(not busy)
         self.audio_browse_button.setEnabled(not busy)
         self.docx_browse_button.setEnabled(not busy)
-        self.open_project_button.setEnabled(not busy)
         self.preflight_button.setEnabled(not busy and has_inputs)
         self.analyze_button.setEnabled(not busy and self._preflight is not None)
         self.task_progress.set_cancel_enabled(busy)
@@ -1802,12 +2012,10 @@ class MainWindow(QMainWindow):
             self.preview_original_button,
             self.preview_selection_button,
             self.preview_edited_button,
-            self.reset_button,
             self.skip_button,
             self.approve_button,
         ):
             control.setEnabled(not busy and has_candidate)
-        self.stop_preview_button.setEnabled(self._audio_player.is_active)
         self.output_path_edit.setEnabled(not busy and has_project)
         self.output_browse_button.setEnabled(not busy and has_project)
         self.review_all_button.setEnabled(
@@ -1837,6 +2045,8 @@ class MainWindow(QMainWindow):
         self._autosave_timer.stop()
         self._stop_preview()
         self._preview_spinner.stop()
+        self._active_word_transcription_generation = 0
+        self._word_transcript_typewriter.stop()
         self.audio_processing_widget.shutdown()
         if self._active_task is not None:
             self._active_task.cancel()
@@ -1869,11 +2079,11 @@ def _make_workspace_button(text: str, icon_name: str, tooltip: str) -> QToolButt
     button.setProperty("nav", True)
     button.setCheckable(True)
     button.setAutoRaise(True)
-    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
     button.setText(text)
-    button.setFixedHeight(62)
+    button.setFixedHeight(52)
     button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    set_button_icon(button, icon_name, size=22, tooltip=tooltip)
+    set_button_icon(button, icon_name, size=20, tooltip=tooltip)
     return button
 
 
@@ -1885,7 +2095,8 @@ def _is_supported_file(path: str, suffixes: set[str]) -> bool:
 def _make_nudge_button(text: str, tooltip: str) -> QPushButton:
     button = QPushButton(text)
     button.setToolTip(tooltip)
-    button.setFixedWidth(74)
+    button.setProperty("compact", True)
+    button.setFixedWidth(70)
     return button
 
 

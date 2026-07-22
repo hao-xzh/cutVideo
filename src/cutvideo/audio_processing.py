@@ -6,6 +6,8 @@ import json
 import math
 import os
 import tempfile
+from bisect import bisect_left
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,9 +20,28 @@ from .project import AudioInfo, ProjectIOError, ProjectValidationError, SourceFi
 
 AUDIO_PROCESSING_SCHEMA: Final = "cutvideo.audio_processing"
 AUDIO_PROCESSING_VERSION: Final = 1
-DEFAULT_SEGMENT_SILENCE_SECONDS: Final = 0.5
-DEFAULT_MAX_SEGMENT_SECONDS: Final = 30.0
+DEFAULT_SEGMENT_SILENCE_SECONDS: Final = 1.0
+DEFAULT_SOFT_SEGMENT_SILENCE_SECONDS: Final = 0.45
+DEFAULT_MIN_SEGMENT_SECONDS: Final = 5.0
+DEFAULT_TARGET_SEGMENT_SECONDS: Final = 14.0
+DEFAULT_MAX_SEGMENT_SECONDS: Final = 60.0
+DEFAULT_MIN_SEGMENT_TOKENS: Final = 12
+DEFAULT_TARGET_SEGMENT_TOKENS: Final = 60
+DEFAULT_MAX_SEGMENT_TOKENS: Final = 320
+TRANSCRIPT_SEGMENTATION_STRATEGY: Final = "semantic_punctuation_pause_v3"
 LOW_RAW_CONFIDENCE_THRESHOLD: Final = 0.40
+BOUNDARY_REFINEMENT_INCOMPLETE_REASON: Final = "boundary_refinement_evidence_incomplete"
+# Reasons that keep an annotation review-required even after an acoustically
+# complete boundary refinement.  A missing per-character confidence value is
+# deliberately not blocking: complete speech-edge plus zero-crossing evidence
+# is independent, direct proof of the cut position.
+_REFINEMENT_BLOCKING_REASONS: Final = frozenset(
+    {
+        "coarse_timestamp",
+        "low_model_confidence",
+        "legacy_boundary_precision_unknown",
+    }
+)
 
 
 def _now() -> str:
@@ -130,23 +151,224 @@ def infer_transcript_segment_starts(
     tokens: list[TranscriptToken],
     sample_rate: int,
     *,
+    voice_ranges_ms: Sequence[tuple[float, float]] = (),
+    sentence_boundary_indexes: Sequence[int] = (),
+    clause_boundary_indexes: Sequence[int] = (),
     silence_seconds: float = DEFAULT_SEGMENT_SILENCE_SECONDS,
     max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
 ) -> list[int]:
-    """Infer stable speech-line starts for projects created before VAD persistence."""
+    """Build readable transcript lines without treating every VAD slice as a line.
+
+    Model punctuation is retained as non-audio boundary evidence even though
+    punctuation itself is intentionally absent from selectable transcript
+    tokens.  Sentence endings outrank duration and token-count targets; pauses
+    and clause punctuation are fallbacks for unusually long spoken sentences.
+    """
 
     if not tokens or sample_rate <= 0:
         return []
-    silence_samples = round(sample_rate * silence_seconds)
-    max_segment_samples = round(sample_rate * max_segment_seconds)
-    starts = [0]
-    segment_start_sample = tokens[0].start_sample
+    if (
+        not math.isfinite(silence_seconds)
+        or not math.isfinite(max_segment_seconds)
+        or silence_seconds <= 0
+        or max_segment_seconds <= 0
+    ):
+        raise ValueError("invalid transcript segmentation parameters")
+
+    strong_pause_samples = max(1, round(sample_rate * silence_seconds))
+    hard_pause_samples = max(
+        strong_pause_samples * 3,
+        round(sample_rate * 2.5),
+    )
+    soft_pause_samples = min(
+        strong_pause_samples,
+        max(1, round(sample_rate * DEFAULT_SOFT_SEGMENT_SILENCE_SECONDS)),
+    )
+    minimum_segment_samples = max(1, round(sample_rate * DEFAULT_MIN_SEGMENT_SECONDS))
+    maximum_segment_samples = max(1, round(sample_rate * max_segment_seconds))
+    target_segment_samples = min(
+        maximum_segment_samples,
+        max(minimum_segment_samples, round(sample_rate * DEFAULT_TARGET_SEGMENT_SECONDS)),
+    )
+
+    pause_samples_by_index = [0] * len(tokens)
     for index in range(1, len(tokens)):
-        token = tokens[index]
-        gap = token.start_sample - tokens[index - 1].end_sample
-        if gap >= silence_samples or token.start_sample - segment_start_sample >= max_segment_samples:
-            starts.append(index)
-            segment_start_sample = token.start_sample
+        pause_samples_by_index[index] = max(
+            0,
+            tokens[index].start_sample - tokens[index - 1].end_sample,
+        )
+
+    normalized_ranges: list[tuple[float, float]] = []
+    for raw_start, raw_end in voice_ranges_ms:
+        try:
+            start_ms = float(raw_start)
+            end_ms = float(raw_end)
+        except (TypeError, ValueError):
+            continue
+        if (
+            math.isfinite(start_ms)
+            and math.isfinite(end_ms)
+            and start_ms >= 0
+            and end_ms > start_ms
+        ):
+            normalized_ranges.append((start_ms, end_ms))
+    normalized_ranges.sort()
+    merged_ranges: list[tuple[float, float]] = []
+    for start_ms, end_ms in normalized_ranges:
+        if merged_ranges and start_ms <= merged_ranges[-1][1]:
+            merged_ranges[-1] = (
+                merged_ranges[-1][0],
+                max(merged_ranges[-1][1], end_ms),
+            )
+        else:
+            merged_ranges.append((start_ms, end_ms))
+
+    token_midpoints = [
+        (token.start_sample + token.end_sample) // 2 for token in tokens
+    ]
+    for left, right in zip(merged_ranges, merged_ranges[1:], strict=False):
+        gap_ms = right[0] - left[1]
+        if gap_ms <= 0:
+            continue
+        boundary_sample = round((left[1] + right[0]) * sample_rate / 2000.0)
+        index = bisect_left(token_midpoints, boundary_sample, lo=1)
+        if index < len(tokens):
+            pause_samples_by_index[index] = max(
+                pause_samples_by_index[index],
+                round(gap_ms * sample_rate / 1000.0),
+            )
+
+    sentence_endings = frozenset("。！？!?；;")
+    clause_endings = frozenset("，,：:")
+
+    def valid_boundary_indexes(values: Sequence[int]) -> set[int]:
+        return {
+            value
+            for value in values
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 < value < len(tokens)
+        }
+
+    semantic_sentence_boundaries = valid_boundary_indexes(
+        sentence_boundary_indexes
+    )
+    semantic_clause_boundaries = valid_boundary_indexes(
+        clause_boundary_indexes
+    )
+    has_model_semantic_evidence = bool(
+        semantic_sentence_boundaries or semantic_clause_boundaries
+    )
+
+    def segment_duration(left: int, right: int) -> int:
+        if right <= left:
+            return 0
+        return max(0, tokens[right - 1].end_sample - tokens[left].start_sample)
+
+    def enough_content(left: int, right: int) -> bool:
+        count = right - left
+        duration = segment_duration(left, right)
+        return (
+            count >= DEFAULT_MIN_SEGMENT_TOKENS
+            and duration >= minimum_segment_samples
+        ) or count >= DEFAULT_MIN_SEGMENT_TOKENS * 3 or duration >= minimum_segment_samples * 2
+
+    def leaves_useful_tail(index: int) -> bool:
+        remaining = len(tokens) - index
+        return (
+            remaining >= DEFAULT_MIN_SEGMENT_TOKENS
+            or segment_duration(index, len(tokens)) >= minimum_segment_samples
+        )
+
+    def boundary_score(segment_start: int, index: int) -> tuple[float, float, int]:
+        pause_ratio = min(
+            2.0,
+            pause_samples_by_index[index] / max(1, strong_pause_samples),
+        )
+        target_distance = abs(
+            segment_duration(segment_start, index) - target_segment_samples
+        )
+        return -float(target_distance), pause_ratio, index
+
+    starts = [0]
+    segment_start = 0
+    while segment_start < len(tokens) - 1:
+        sentence_candidates: list[int] = []
+        clause_candidates: list[int] = []
+        pause_candidates: list[int] = []
+        chosen: int | None = None
+        for index in range(segment_start + 1, len(tokens)):
+            duration = segment_duration(segment_start, index)
+            count = index - segment_start
+            pause = pause_samples_by_index[index]
+            sentence_boundary = (
+                index in semantic_sentence_boundaries
+                or tokens[index - 1].text[-1:] in sentence_endings
+            )
+            clause_boundary = (
+                index in semantic_clause_boundaries
+                or tokens[index - 1].text[-1:] in clause_endings
+            )
+            content_ready = enough_content(segment_start, index)
+            tail_ready = leaves_useful_tail(index)
+
+            if sentence_boundary and content_ready and tail_ready:
+                sentence_candidates.append(index)
+                if (
+                    duration >= target_segment_samples
+                    or count >= DEFAULT_TARGET_SEGMENT_TOKENS
+                ):
+                    chosen = index
+                    break
+            elif clause_boundary and content_ready and tail_ready:
+                clause_candidates.append(index)
+            if pause >= soft_pause_samples and content_ready and tail_ready:
+                pause_candidates.append(index)
+
+            # A genuinely long silence is an utterance boundary even when one
+            # side is only a short reply such as “好” or “嗯”.
+            if pause >= hard_pause_samples and (
+                tail_ready or not has_model_semantic_evidence
+            ):
+                chosen = index
+                break
+            if (
+                not has_model_semantic_evidence
+                and pause >= strong_pause_samples
+                and content_ready
+                and tail_ready
+                and duration >= target_segment_samples * 4 // 5
+            ):
+                chosen = index
+                break
+
+            if (
+                duration >= maximum_segment_samples
+                or count >= DEFAULT_MAX_SEGMENT_TOKENS
+            ):
+                if not tail_ready:
+                    continue
+                candidates = (
+                    sentence_candidates
+                    or clause_candidates
+                    or pause_candidates
+                )
+                chosen = (
+                    max(
+                        candidates,
+                        key=lambda candidate: boundary_score(
+                            segment_start, candidate
+                        ),
+                    )
+                    if candidates
+                    else index
+                )
+                break
+
+        if chosen is None:
+            break
+        starts.append(chosen)
+        segment_start = chosen
     return starts
 
 
@@ -327,6 +549,51 @@ class AudioProcessingProject:
         self.updated_at = _now()
         return annotation
 
+    def apply_annotation_boundary_refinement(
+        self,
+        annotation_id: str,
+        *,
+        start_sample: int,
+        end_sample: int,
+        evidence_complete: bool,
+        diagnostics: dict[str, Any],
+    ) -> AudioAnnotation | None:
+        """Adopt an acoustic (silence/zero-crossing) boundary refinement."""
+
+        annotation = next(
+            (item for item in self.annotations if item.id == annotation_id),
+            None,
+        )
+        if annotation is None:
+            return None
+        if not 0 <= start_sample < end_sample <= self.audio_info.total_samples:
+            return None
+        annotation.start_sample = int(start_sample)
+        annotation.end_sample = int(end_sample)
+        annotation.diagnostics = {
+            **annotation.diagnostics,
+            "boundary_source": "model_timestamp+acoustic_refinement",
+            "boundary_refinement": dict(diagnostics),
+        }
+        remaining = [
+            reason
+            for reason in annotation.review_reasons
+            if reason in _REFINEMENT_BLOCKING_REASONS
+        ]
+        if evidence_complete and not remaining:
+            annotation.review_required = False
+            annotation.review_reasons = []
+        else:
+            if not evidence_complete:
+                remaining.append(BOUNDARY_REFINEMENT_INCOMPLETE_REASON)
+            annotation.review_required = True
+            annotation.review_reasons = list(
+                dict.fromkeys(remaining or ["boundary_precision_unverified"])
+            )
+        self.annotations.sort(key=lambda item: (item.start_sample, item.end_sample))
+        self.updated_at = _now()
+        return annotation
+
     def mark_annotation_boundary_reviewed(
         self,
         annotation_id: str,
@@ -361,6 +628,85 @@ class AudioProcessingProject:
             self.updated_at = _now()
             return True
         return False
+
+    def apply_character_timestamp_refinement(
+        self,
+        refined_tokens: Sequence[TranscriptToken],
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> int:
+        """Replace draft ASR timestamps once fa-zh character refinement finishes.
+
+        Text identity must stay identical so streamed transcript ranges remain
+        stable.  Annotations whose boundaries still come from model timestamps
+        are remapped; manually confirmed or acoustically refined boundaries are
+        left untouched.
+        """
+
+        if len(refined_tokens) != len(self.tokens):
+            raise ProjectValidationError("精修后的转写长度与草稿不一致")
+        updated = 0
+        next_tokens: list[TranscriptToken] = []
+        for original, refined in zip(self.tokens, refined_tokens, strict=True):
+            if original.text != refined.text:
+                raise ProjectValidationError("精修后的转写文字与草稿不一致")
+            refined.validate(self.audio_info.total_samples)
+            if (
+                original.start_sample != refined.start_sample
+                or original.end_sample != refined.end_sample
+                or original.timestamp_precision != refined.timestamp_precision
+            ):
+                updated += 1
+            next_tokens.append(refined)
+        previous_start = -1
+        previous_end = -1
+        for token in next_tokens:
+            if token.start_sample < previous_start or token.end_sample < previous_end:
+                raise ProjectValidationError("精修后的转写 token 时间必须递增")
+            previous_start = token.start_sample
+            previous_end = token.end_sample
+        self.tokens = next_tokens
+        for annotation in self.annotations:
+            if annotation.diagnostics.get("manual_review_confirmed"):
+                continue
+            if annotation.diagnostics.get("boundary_source") not in {
+                None,
+                "model_timestamp",
+            }:
+                continue
+            start_sample = self.tokens[annotation.token_start].start_sample
+            end_sample = self.tokens[annotation.token_end - 1].end_sample
+            review_required, review_reasons, review_diagnostics = _annotation_review_metadata(
+                self.tokens[annotation.token_start : annotation.token_end]
+            )
+            annotation.start_sample = start_sample
+            annotation.end_sample = end_sample
+            annotation.review_required = review_required
+            annotation.review_reasons = review_reasons
+            annotation.diagnostics = {
+                **annotation.diagnostics,
+                **review_diagnostics,
+            }
+        if diagnostics is not None:
+            self.analysis_diagnostics = {
+                **self.analysis_diagnostics,
+                "character_refinement": dict(diagnostics),
+                "character_refinement_status": "completed",
+            }
+        else:
+            self.analysis_diagnostics = {
+                **self.analysis_diagnostics,
+                "character_refinement_status": "completed",
+            }
+        precision_counts: dict[str, int] = {}
+        for item in self.tokens:
+            precision_counts[item.timestamp_precision] = (
+                precision_counts.get(item.timestamp_precision, 0) + 1
+            )
+        self.analysis_diagnostics["timestamp_precision_counts"] = precision_counts
+        self.updated_at = _now()
+        self.validate()
+        return updated
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -456,6 +802,8 @@ def load_audio_processing_project(path: str | Path) -> AudioProcessingProject:
 __all__ = [
     "AUDIO_PROCESSING_SCHEMA",
     "AUDIO_PROCESSING_VERSION",
+    "BOUNDARY_REFINEMENT_INCOMPLETE_REASON",
+    "TRANSCRIPT_SEGMENTATION_STRATEGY",
     "AudioAnnotation",
     "AudioProcessingProject",
     "TranscriptToken",

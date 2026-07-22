@@ -27,16 +27,16 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
     assert isinstance(app, QApplication)
     window = MainWindow()
     try:
-        assert window.windowTitle() == "cutVideo by Hao"
+        assert window.windowTitle() == "CutVideo · 离线音频工作台"
         assert window.workspace_tabs.count() == 2
-        assert window.workspace_tabs.tabText(0) == "Word 黄标剪辑"
-        assert window.workspace_tabs.tabText(1) == "音频处理"
-        assert window.audio_processing_widget.add_delete_button.text() == "标注为删除"
-        assert window.audio_processing_widget.preview_original_button.text() == "听原音（前后 3 秒）"
-        assert window.audio_processing_widget.preview_selection_button.text() == "只听删除"
+        assert window.word_workspace_button.text() == "Word 剪辑"
+        assert window.audio_workspace_button.text() == "音频处理"
+        assert window.audio_processing_widget.add_delete_button.text() == "标记删除"
+        assert window.audio_processing_widget.preview_original_button.text() == "原音 ±3s"
+        assert window.audio_processing_widget.preview_selection_button.text() == "删除段"
         assert not app.windowIcon().isNull()
-        assert window.centralWidget().objectName() == "workspaceTabs"
-        assert window.step_labels[0].property("stepState") == "active"
+        assert window.centralWidget().objectName() == "applicationShell"
+        assert window.workspace_tabs.objectName() == "workspaceStack"
         assert Path(window._preview_directory.path()).parent == Path(QDir.tempPath())
         assert window.audio_path_edit.objectName() == "audioPathEdit"
         assert window.docx_path_edit.objectName() == "docxPathEdit"
@@ -50,18 +50,16 @@ def test_main_window_constructs_with_core_workflow_controls() -> None:
         assert window.skip_button.text() == "保留此处"
         assert window.start_minus_button.text() == "−20 ms"
         assert window.end_plus_button.text() == "+20 ms"
-        assert window.waveform_zoom_out_button.text() == "缩小"
-        assert window.waveform_zoom_in_button.text() == "放大"
-        assert window.waveform_focus_button.text() == "定位切点"
+        assert window.waveform_zoom_out_button.objectName() == "waveformZoomOutButton"
+        assert window.waveform_zoom_in_button.objectName() == "waveformZoomInButton"
+        assert window.waveform_focus_button.objectName() == "waveformFocusButton"
         assert window.waveform_scrollbar.objectName() == "waveformScrollBar"
         assert window.review_all_button.objectName() == "reviewAllButton"
         assert window.export_button.objectName() == "exportButton"
         assert not window.export_button.isEnabled()
-        assert not window.progress_container.isHidden()
-        assert window.progress_container.height() == 36
-        assert window.progress_bar.isHidden()
-        assert not window.audio_processing_widget.progress_container.isHidden()
-        assert window.audio_processing_widget.progress_container.height() == 36
+        # Progress views stay hidden until a background task starts.
+        assert window.progress_container.isHidden()
+        assert window.audio_processing_widget.progress_container.isHidden()
     finally:
         window.close()
 
@@ -204,7 +202,10 @@ def test_waveform_view_can_pan_zoom_and_return_to_selection() -> None:
     assert widget.view_range == (2_000, 6_500)
 
 
-def test_dragging_boundary_near_edge_auto_pans_the_waveform() -> None:
+def test_dragging_boundary_near_edge_keeps_the_view_stable() -> None:
+    # The pixel-to-sample mapping must not change mid-drag: auto-panning while
+    # a boundary is being dragged causes visible jitter, so the view stays
+    # fixed and panning remains an explicit operation.
     create_application(["cutvideo-test"])
     widget = WaveformWidget()
     widget.resize(600, 200)
@@ -226,7 +227,7 @@ def test_dragging_boundary_near_edge_auto_pans_the_waveform() -> None:
         )
 
         assert widget.selection[1] > 6_300
-        assert widget.view_range[1] > 6_500
+        assert widget.view_range == (2_000, 6_500)
     finally:
         widget.close()
 

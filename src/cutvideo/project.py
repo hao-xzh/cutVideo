@@ -327,17 +327,17 @@ class CutCandidate:
 
         paragraph_index = _object_int(alignment, "paragraph_index")
         highlight_index = _object_int(alignment, "highlight_index")
-        requires_review = bool(getattr(alignment, "requires_review", False))
+        # Alignment may grade a suggestion as high-confidence, but Word yellow
+        # highlights are never deletion decisions.  Every new suggestion must
+        # be explicitly confirmed or kept by a person.
+        requires_review = True
         raw_status = _enum_value(getattr(alignment, "status", ""))
-        if raw_status == "auto_approved":
-            status = CandidateStatus.AUTO_APPROVED
-        elif raw_status == "approved":
+        if raw_status == "approved":
             status = CandidateStatus.APPROVED
         elif raw_status == "skipped":
             status = CandidateStatus.SKIPPED
         else:
             status = CandidateStatus.NEEDS_REVIEW
-            requires_review = True
         text = getattr(alignment, "text", None)
         if text is None:
             text = getattr(alignment, "highlighted_text", None)
@@ -368,11 +368,11 @@ class CutCandidate:
 
     @property
     def is_selected(self) -> bool:
-        return self.status in {CandidateStatus.AUTO_APPROVED, CandidateStatus.APPROVED}
+        return self.status is CandidateStatus.APPROVED
 
     @property
     def needs_review(self) -> bool:
-        return self.status is CandidateStatus.NEEDS_REVIEW
+        return self.status not in {CandidateStatus.APPROVED, CandidateStatus.SKIPPED}
 
     @property
     def effective_start_sample(self) -> int:
@@ -404,11 +404,8 @@ class CutCandidate:
     def reset(self) -> None:
         self.final_start_sample = None
         self.final_end_sample = None
-        self.status = (
-            CandidateStatus.NEEDS_REVIEW
-            if self.review_required
-            else CandidateStatus.AUTO_APPROVED
-        )
+        self.review_required = True
+        self.status = CandidateStatus.NEEDS_REVIEW
 
     def validate(self, index: int | None = None, total_samples: int | None = None) -> None:
         label = f"candidates[{index}]" if index is not None else "candidate"
@@ -508,6 +505,12 @@ class CutCandidate:
             status=_string_field(data, "status", label),
             review_required=_optional_bool_field(data, "review_required", label, True),
         )
+        # Automatic approval is no longer a release decision in Word mode.
+        # Preserve explicit human choices (APPROVED/SKIPPED), but migrate every
+        # historic machine-approved yellow highlight back into the review queue.
+        if candidate.status is CandidateStatus.AUTO_APPROVED:
+            candidate.status = CandidateStatus.NEEDS_REVIEW
+            candidate.review_required = True
         candidate.validate(index)
         return candidate
 
