@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QScrollBar,
@@ -55,7 +56,7 @@ from PySide6.QtWidgets import (
 from ..audio import AudioInfo, WaveformEnvelope
 from ..ffmpeg import FFmpegTools, discover_ffmpeg
 from ..project import CandidateStatus, CutCandidate, ProjectV1, save_project
-from ..resources import discover_resources
+from ..resources import find_resource_root
 from .audio_player import AudioPlaybackError, PcmWavPlayer
 from .audio_processing_widget import AudioProcessingWidget
 from .backdrop import ThemedBackdrop
@@ -86,6 +87,7 @@ from .workers import (
     make_analysis_operation,
     make_export_operation,
     make_load_project_operation,
+    make_model_preparation_operation,
     make_preflight_operation,
     make_preview_operation,
     make_recognition_warmup_operation,
@@ -187,6 +189,15 @@ class MainWindow(QMainWindow):
         self._word_transcription_generation = 0
         self._active_word_transcription_generation = 0
         self._model_warmup_started = False
+        self._models_ready = False
+        self._model_bootstrap_task: BackgroundTask | None = None
+        self._model_bootstrap_progress_dialog: QProgressDialog | None = None
+        self._model_bootstrap_show_timer = QTimer(self)
+        self._model_bootstrap_show_timer.setSingleShot(True)
+        self._model_bootstrap_show_timer.timeout.connect(self._show_model_bootstrap_progress)
+        self._model_bootstrap_last_progress: tuple[int, str] = (0, "正在检查本地模型…")
+        self._model_bootstrap_failed_message: str | None = None
+        self._model_bootstrap_retry_requested = False
         self._macos_titlebar_configured = False
 
         self._build_ui()
@@ -209,8 +220,46 @@ class MainWindow(QMainWindow):
             return
         self._macos_titlebar_configured = make_titlebar_immersive(self)
 
+    def start_model_bootstrap(self, *, force: bool = False) -> None:
+        """Prepare the local model store before any recognition task starts."""
+
+        if self._models_ready and not force:
+            return
+        if self._model_bootstrap_task is not None:
+            self._show_model_bootstrap_progress()
+            return
+        self._models_ready = False
+        self._model_bootstrap_failed_message = None
+        self._model_bootstrap_retry_requested = False
+        self._model_bootstrap_last_progress = (0, "正在检查本地模型…")
+        self.audio_processing_widget.set_model_bootstrap_state(
+            ready=False,
+            active=True,
+            message="正在检查本地模型…",
+        )
+
+        def begin() -> None:
+            if self._models_ready or self._model_bootstrap_task is not None:
+                return
+            task = BackgroundTask(make_model_preparation_operation(find_resource_root()))
+            self._model_bootstrap_task = task
+            task.signals.progress.connect(self._model_bootstrap_progress_changed)
+            task.signals.result.connect(self._model_bootstrap_completed)
+            task.signals.error.connect(self._model_bootstrap_failed)
+            task.signals.cancelled.connect(self._model_bootstrap_cancelled)
+            task.signals.finished.connect(lambda: self._model_bootstrap_finished(task))
+            self._model_bootstrap_show_timer.start(300)
+            self.thread_pool.start(task)
+            self._refresh_controls()
+
+        QTimer.singleShot(50, begin)
+
     def start_model_warmup(self) -> None:
-        """Prepare the shared local recognizer after the first window is visible."""
+        """Load and prime the shared recognizer after model files are ready."""
+
+        if not self._models_ready:
+            self.start_model_bootstrap()
+            return
 
         if self._model_warmup_started:
             return
@@ -224,6 +273,140 @@ class MainWindow(QMainWindow):
             )
 
         QTimer.singleShot(250, begin)
+
+    def _show_model_bootstrap_progress(self) -> None:
+        if self._models_ready or self._model_bootstrap_task is None:
+            return
+        value, message = self._model_bootstrap_last_progress
+        if self._model_bootstrap_progress_dialog is None:
+            dialog = QProgressDialog(
+                message or "正在准备本地模型…",
+                "取消",
+                0,
+                100,
+                self,
+            )
+            dialog.setWindowTitle("正在准备本地模型")
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setMinimumDuration(0)
+            dialog.canceled.connect(self._cancel_model_bootstrap)
+            self._model_bootstrap_progress_dialog = dialog
+        self._model_bootstrap_progress_dialog.setValue(value)
+        self._model_bootstrap_progress_dialog.setLabelText(
+            message or "正在准备本地模型…"
+        )
+        self._model_bootstrap_progress_dialog.show()
+        self._model_bootstrap_progress_dialog.raise_()
+        self._model_bootstrap_progress_dialog.activateWindow()
+
+    def _close_model_bootstrap_progress(self) -> None:
+        self._model_bootstrap_show_timer.stop()
+        if self._model_bootstrap_progress_dialog is not None:
+            self._model_bootstrap_progress_dialog.hide()
+            self._model_bootstrap_progress_dialog.deleteLater()
+            self._model_bootstrap_progress_dialog = None
+
+    def _cancel_model_bootstrap(self) -> None:
+        if self._model_bootstrap_task is None:
+            return
+        self._model_bootstrap_last_progress = (self._model_bootstrap_last_progress[0], "正在取消模型准备…")
+        if self._model_bootstrap_progress_dialog is not None:
+            self._model_bootstrap_progress_dialog.setLabelText("正在取消模型准备…")
+            self._model_bootstrap_progress_dialog.setCancelButtonText("正在取消")
+        self._model_bootstrap_task.cancel()
+
+    def _model_bootstrap_progress_changed(self, value: int, message: str) -> None:
+        message = message or "正在准备本地模型…"
+        self._model_bootstrap_last_progress = (value, message)
+        self.audio_processing_widget.set_model_bootstrap_state(
+            ready=False,
+            active=True,
+            message=message,
+        )
+        if self._model_bootstrap_progress_dialog is not None:
+            self._model_bootstrap_progress_dialog.setValue(value)
+            self._model_bootstrap_progress_dialog.setLabelText(message)
+
+    def _model_bootstrap_completed(self, result: object) -> None:
+        self._models_ready = True
+        self._model_bootstrap_failed_message = None
+        self._close_model_bootstrap_progress()
+        model_root = getattr(result, "model_root", None)
+        model_source = getattr(result, "source", None) or getattr(result, "model_source", None)
+        detail = f"：{model_source}" if model_source else ""
+        if model_root is not None:
+            detail += f" · {model_root}"
+        message = f"本地模型已就绪{detail}"
+        self.statusBar().showMessage(message)
+        self.audio_processing_widget.set_model_bootstrap_state(
+            ready=True,
+            active=False,
+            message=message,
+        )
+        self._refresh_controls()
+        self.start_model_warmup()
+
+    def _model_bootstrap_failed(self, message: str) -> None:
+        self._models_ready = False
+        self._model_bootstrap_failed_message = message
+        self._close_model_bootstrap_progress()
+        self.audio_processing_widget.set_model_bootstrap_state(
+            ready=False,
+            active=False,
+            message=f"本地模型准备失败：{message}",
+        )
+        self._refresh_controls()
+        box = QMessageBox(QMessageBox.Icon.Warning, "本地模型准备失败", message, parent=self)
+        retry_button = box.addButton("重试", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is retry_button:
+            self._model_bootstrap_retry_requested = True
+            # QMessageBox runs a nested event loop, so the worker's finished
+            # signal may already have cleared the task before the user clicks.
+            # Schedule an idle retry as well as keeping the finished-path flag.
+            QTimer.singleShot(0, self._retry_model_bootstrap_if_idle)
+
+    def _retry_model_bootstrap_if_idle(self) -> None:
+        if not self._model_bootstrap_retry_requested or self._model_bootstrap_task is not None:
+            return
+        self._model_bootstrap_retry_requested = False
+        self.start_model_bootstrap(force=True)
+
+    def _model_bootstrap_cancelled(self) -> None:
+        self._models_ready = False
+        self._close_model_bootstrap_progress()
+        self.audio_processing_widget.set_model_bootstrap_state(
+            ready=False,
+            active=False,
+            message="本地模型准备已取消",
+        )
+        self.statusBar().showMessage("本地模型准备已取消，可在识别时重新尝试")
+        self._refresh_controls()
+
+    def _model_bootstrap_finished(self, task: BackgroundTask) -> None:
+        if self._model_bootstrap_task is task:
+            self._model_bootstrap_task = None
+        retry = self._model_bootstrap_retry_requested
+        self._model_bootstrap_retry_requested = False
+        self._refresh_controls()
+        if retry:
+            self.start_model_bootstrap(force=True)
+
+    def _ensure_models_ready_for(self, action: str) -> bool:
+        if self._models_ready:
+            return True
+        if self._model_bootstrap_task is None:
+            self.start_model_bootstrap(force=True)
+            message = f"{action}需要本地模型，正在准备/下载；完成后请再次点击。"
+        else:
+            self._show_model_bootstrap_progress()
+            message = f"{action}需要本地模型，当前仍在准备。"
+        self.statusBar().showMessage(message)
+        self.word_stream_summary.setText(message)
+        return False
 
     def _build_ui(self) -> None:
         shell = ThemedBackdrop(self)
@@ -732,6 +915,9 @@ class MainWindow(QMainWindow):
         self.audio_path_edit.textChanged.connect(self._inputs_changed)
         self.docx_path_edit.textChanged.connect(self._inputs_changed)
         self.audio_processing_widget.statusMessage.connect(self.statusBar().showMessage)
+        self.audio_processing_widget.modelPreparationRequested.connect(
+            lambda: self.start_model_bootstrap(force=True)
+        )
         self.workspace_navigation.idClicked.connect(self._switch_workspace)
         self.workspace_tabs.currentChanged.connect(self._workspace_changed)
         self.help_button.clicked.connect(self._show_usage_guide)
@@ -1113,16 +1299,11 @@ class MainWindow(QMainWindow):
         self.tools = result.tools
         transcript = result.transcript
         duration = _format_ms(result.audio_info.total_samples, result.audio_info.sample_rate)
-        missing_models = [
-            item for item in result.resources.missing() if item not in {"ffmpeg", "ffprobe"}
-        ]
         summary = (
             f"{len(transcript.paragraphs)} 个时间锚点 · "
             f"{len(transcript.highlights)} 处黄色标记 · "
             f"{transcript.highlighted_char_count} 个标记字符 · 音频 {duration}"
         )
-        if missing_models:
-            summary += " · 本地模型不完整，将生成全部需复核的安全估算"
         self.input_summary_label.setText(summary)
         self.output_path_edit.setText(str(Path(result.audio_info.path).parent))
         self.statusBar().showMessage("预检完成，可以开始自动分析")
@@ -1139,6 +1320,8 @@ class MainWindow(QMainWindow):
 
     def _start_analysis(self) -> None:
         if self._preflight is None or self._active_task is not None:
+            return
+        if not self._ensure_models_ready_for("Word 自动分析"):
             return
         self._set_step(2)
         self._word_transcription_generation += 1
@@ -1234,8 +1417,7 @@ class MainWindow(QMainWindow):
                 ),
             )
             return
-        resources = discover_resources()
-        self.tools = discover_ffmpeg(resource_root=resources.root)
+        self.tools = discover_ffmpeg(resource_root=find_resource_root())
         self._preflight = None
         self._setting_paths = True
         try:
@@ -1301,8 +1483,7 @@ class MainWindow(QMainWindow):
         self.waveform_envelope = envelope
         self.waveform.clear()
         if self.tools is None:
-            resources = discover_resources()
-            self.tools = discover_ffmpeg(resource_root=resources.root)
+            self.tools = discover_ffmpeg(resource_root=find_resource_root())
         self.output_path_edit.setText(project.export_options.output_directory)
         self._populate_candidates()
         if envelope is not None:
@@ -1994,6 +2175,13 @@ class MainWindow(QMainWindow):
         self.docx_browse_button.setEnabled(not busy)
         self.preflight_button.setEnabled(not busy and has_inputs)
         self.analyze_button.setEnabled(not busy and self._preflight is not None)
+        if self._preflight is not None and not self._models_ready:
+            if self._model_bootstrap_task is not None:
+                self.analyze_button.setToolTip("本地模型正在准备，完成后即可自动分析")
+            else:
+                self.analyze_button.setToolTip("本地模型未就绪，点击后会重新准备/下载模型")
+        else:
+            self.analyze_button.setToolTip("")
         self.task_progress.set_cancel_enabled(busy)
         self.candidate_table.setEnabled(not busy and has_project)
         waveform_enabled = not busy and has_candidate and has_waveform
@@ -2048,6 +2236,9 @@ class MainWindow(QMainWindow):
         self._active_word_transcription_generation = 0
         self._word_transcript_typewriter.stop()
         self.audio_processing_widget.shutdown()
+        self._close_model_bootstrap_progress()
+        if self._model_bootstrap_task is not None:
+            self._model_bootstrap_task.cancel()
         if self._active_task is not None:
             self._active_task.cancel()
         for task in tuple(self._auxiliary_tasks):

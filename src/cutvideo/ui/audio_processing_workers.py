@@ -38,7 +38,7 @@ from ..audio_processing import (
     load_audio_processing_project,
     save_audio_processing_project,
 )
-from ..ffmpeg import FFmpegTools, export_audio, generate_preview
+from ..ffmpeg import FFmpegTools, discover_ffmpeg, export_audio, generate_preview
 from ..model_runtime import model_execution_guard, resolve_inference_device
 from ..progressive_asr import (
     ProgressiveRecognitionChunk,
@@ -46,7 +46,12 @@ from ..progressive_asr import (
 )
 from ..project import AudioInfo as ProjectAudioInfo
 from ..project import SourceFile
-from ..resources import RuntimeResources, discover_resources
+from ..resources import (
+    RuntimeResources,
+    discover_resources,
+    find_resource_root,
+    platform_key,
+)
 from .workers import (
     AsrTranscriptPartial,
     CancelToken,
@@ -837,10 +842,7 @@ def make_audio_processing_load_operation(project_path: str) -> Operation:
                     "semantic_segmentation_upgrade_required"
                 ] = True
         source_matches = project.audio.matches_file(project.audio.path)
-        resources = discover_resources()
-        if not resources.has_ffmpeg:
-            raise FileNotFoundError("缺少本平台的 FFmpeg 离线资源")
-        tools = FFmpegTools(resources.ffmpeg, resources.ffprobe)  # type: ignore[arg-type]
+        tools = discover_ffmpeg(resource_root=find_resource_root())
         if source_matches:
             info, waveform_envelope = probe_audio_with_waveform(
                 project.audio.path,
@@ -865,7 +867,6 @@ def make_audio_processing_load_operation(project_path: str) -> Operation:
         refinement_pending = bool(
             source_matches
             and project.tokens
-            and (resources.qwen_force_model is not None or resources.fa_model is not None)
             and project.analysis_diagnostics.get("character_refinement_status")
             != "completed"
         )
@@ -898,10 +899,7 @@ def make_audio_processing_relink_operation(
         project.audio.relink(audio_path)
         if old_output == old_audio_parent:
             project.output_directory = str(Path(project.audio.path).parent)
-        resources = discover_resources()
-        if not resources.has_ffmpeg:
-            raise FileNotFoundError("缺少本平台的 FFmpeg 离线资源")
-        tools = FFmpegTools(resources.ffmpeg, resources.ffprobe)  # type: ignore[arg-type]
+        tools = discover_ffmpeg(resource_root=find_resource_root())
         report(0.45, "正在核对音频时间轴…")
         info, waveform_envelope = probe_audio_with_waveform(
             project.audio.path,
@@ -916,7 +914,6 @@ def make_audio_processing_relink_operation(
         save_audio_processing_project(project, path)
         refinement_pending = bool(
             project.tokens
-            and (resources.qwen_force_model is not None or resources.fa_model is not None)
             and project.analysis_diagnostics.get("character_refinement_status")
             != "completed"
         )
@@ -968,7 +965,11 @@ def make_annotation_boundary_refinement_operation(
         working_start = start_sample
         working_end = end_sample
         force_diagnostics: dict[str, object] | None = None
-        if enable_force_realign and selected_text.strip():
+        if (
+            enable_force_realign
+            and selected_text.strip()
+            and platform_key() != "macos-arm64"
+        ):
             resources = discover_resources()
             # Qwen already aligned the complete transcript with neighbouring
             # context.  Re-aligning only the selected phrase inside a padded

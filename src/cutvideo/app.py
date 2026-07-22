@@ -47,7 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     app = create_application(arguments)
     window = MainWindow()
     window.show()
-    window.start_model_warmup()
+    window.start_model_bootstrap()
     return app.exec()
 
 

@@ -21,17 +21,18 @@ if [[ "${ALLOW_UNPINNED:-0}" == "1" ]]; then
 fi
 "$PYTHON" "${VERIFY_ARGS[@]}"
 
-# The source tree keeps the legacy FunASR assets for Windows.  The Apple
-# Silicon release carries only the Qwen/MLX pair so users do not pay for two
-# complete recognition stacks in one DMG.
+# macOS DMGs are deliberately code-only.  Models live in Application Support
+# and are migrated from an older full bundle or downloaded once at runtime.
+# The source-tree models remain available for the frozen external-model smoke
+# test below, but no model weight may enter the app bundle.
 RESOURCE_STAGE="$ROOT/build/resources-macos"
 rm -rf "$RESOURCE_STAGE"
 ditto "$ROOT/resources" "$RESOURCE_STAGE"
-rm -rf \
-  "$RESOURCE_STAGE/models/fa-zh" \
-  "$RESOURCE_STAGE/models/paraformer-zh" \
-  "$RESOURCE_STAGE/models/fsmn-vad"
-"$PYTHON" scripts/verify_resources.py --resource-root "$RESOURCE_STAGE"
+rm -rf "$RESOURCE_STAGE/models"
+mkdir -p "$RESOURCE_STAGE/models"
+"$PYTHON" scripts/verify_resources.py \
+  --resource-root "$RESOURCE_STAGE" \
+  --model-mode download-only
 
 "$PYTHON" -m PyInstaller \
   --noconfirm \
@@ -75,6 +76,10 @@ APP_VERSION="$(PYTHONPATH="$ROOT/src" "$PYTHON" -c 'from cutvideo import __versi
 /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MACOSX_DEPLOYMENT_TARGET" "$APP/Contents/Info.plist" \
   || /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MACOSX_DEPLOYMENT_TARGET" "$APP/Contents/Info.plist"
 file "$APP/Contents/MacOS/CutVideo" | grep -q "arm64"
+if find "$APP/Contents" -type f \( -name '*.safetensors' -o -name '*.onnx' \) | grep -q .; then
+  echo "code-only macOS bundle unexpectedly contains model weights" >&2
+  exit 1
+fi
 "$PYTHON" scripts/audit_macos_bundle.py "$APP" --maximum-minos "$MACOSX_DEPLOYMENT_TARGET"
 if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --deep --options runtime --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$APP"
@@ -83,16 +88,55 @@ else
 fi
 codesign --verify --deep --strict --verbose=2 "$APP"
 REPORT="${TMPDIR:-/tmp}/cutvideo-selftest-$$.json"
-CUTVIDEO_SELFTEST_REPORT="$REPORT" "$APP/Contents/MacOS/CutVideo" --self-test-models
+CUTVIDEO_MODEL_ROOT="$ROOT/resources/models" \
+  CUTVIDEO_SELFTEST_REPORT="$REPORT" \
+  "$APP/Contents/MacOS/CutVideo" --self-test-models
 cat "$REPORT"
 rm -f "$REPORT"
 STAGE="dist/dmg-root"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-ditto "$APP" "$STAGE/CutVideo.app"
-ln -s /Applications "$STAGE/Applications"
+PKG="dist/CutVideo.pkg"
+PKG_ROOT="$ROOT/build/pkg-root"
+rm -rf "$PKG_ROOT"
+mkdir -p "$PKG_ROOT/Applications"
+ditto "$APP" "$PKG_ROOT/Applications/CutVideo.app"
+PKG_ARGS=(
+  --root "$PKG_ROOT"
+  --install-location /
+  --component-plist "$ROOT/scripts/macos-component.plist"
+  --scripts "$ROOT/scripts/macos-pkg-scripts"
+  --identifier com.cutvideo.app
+  --version "$APP_VERSION"
+  --ownership recommended
+)
+if [[ -n "${APPLE_INSTALLER_IDENTITY:-}" ]]; then
+  PKG_ARGS+=(--sign "$APPLE_INSTALLER_IDENTITY")
+fi
+pkgbuild "${PKG_ARGS[@]}" "$PKG"
+pkgutil --check-signature "$PKG" || [[ -z "${APPLE_INSTALLER_IDENTITY:-}" ]]
+PKG_AUDIT="$ROOT/build/pkg-audit"
+rm -rf "$PKG_AUDIT"
+pkgutil --expand-full "$PKG" "$PKG_AUDIT"
+if find "$PKG_AUDIT" -type f \( -name '*.safetensors' -o -name '*.onnx' \) | grep -q .; then
+  echo "code-only installer unexpectedly contains model weights" >&2
+  exit 1
+fi
+if ! find "$PKG_AUDIT" -type f -name migrate-models -perm -111 | grep -q . \
+  || ! grep -R -q 'migrate-models' "$PKG_AUDIT"; then
+  echo "installer is missing the executable legacy-model migration hook" >&2
+  exit 1
+fi
+ditto "$PKG" "$STAGE/安装 CutVideo.pkg"
+if [[ "$(find "$STAGE" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" != "1" ]]; then
+  echo "DMG staging root must contain exactly one installer" >&2
+  exit 1
+fi
 hdiutil create -volname CutVideo -srcfolder "$STAGE" -ov -format UDZO dist/CutVideo.dmg
+hdiutil verify dist/CutVideo.dmg
 if [[ "${KEEP_MACOS_APP_BUNDLE:-0}" != "1" ]]; then
   rm -rf "$STAGE" "$APP"
 fi
 rm -rf "$RESOURCE_STAGE"
+rm -rf "$PKG_ROOT"
+rm -rf "$PKG_AUDIT"

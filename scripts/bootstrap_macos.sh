@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ "${1:-}" != "--accept-model-licenses" || $# -ne 1 ]]; then
   echo "Usage: bash scripts/bootstrap_macos.sh --accept-model-licenses" >&2
-  echo "Review the three Apache-2.0 model cards before accepting." >&2
+  echo "Review the two Qwen Apache-2.0 model cards before accepting." >&2
   exit 2
 fi
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
@@ -41,7 +41,7 @@ fi
 
 .venv/bin/python -m pip install --upgrade pip setuptools wheel
 .venv/bin/python -m pip install -c constraints-release.txt -e '.[dev,ml]'
-.venv/bin/python scripts/fetch_models.py --accept-model-licenses
+.venv/bin/python scripts/fetch_qwen_models.py --accept-model-licenses
 .venv/bin/python -m pip check
 .venv/bin/python -m pytest -q
 .venv/bin/python -m ruff check src tests scripts

@@ -43,6 +43,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-unpinned", action="store_true")
     parser.add_argument(
+        "--model-mode",
+        choices=("bundled", "download-only"),
+        default="bundled",
+        help=(
+            "verify model files in the resource tree, or only verify the "
+            "pinned download metadata used by a code-only macOS bundle"
+        ),
+    )
+    parser.add_argument(
         "--resource-root",
         type=Path,
         default=ROOT / "resources",
@@ -169,9 +178,11 @@ def main() -> int:
         if not isinstance(entry, dict):
             errors.append(f"missing model manifest entry: {name}")
             continue
-        model_dir = resource_root / entry["path"]
-        if not model_dir.is_dir() or not any(model_dir.iterdir()):
-            errors.append(f"missing model: {model_dir}")
+        path_value = entry.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            errors.append(f"missing model path: {name}")
+            continue
+        model_dir = resource_root / path_value
         if not entry.get("license") and not args.allow_unpinned:
             errors.append(f"missing model license entry: {name}")
         elif entry.get("license") and not (resource_root / entry["license"]).is_file():
@@ -179,17 +190,62 @@ def main() -> int:
         expected = entry.get("sha256")
         if not expected and not args.allow_unpinned:
             errors.append(f"missing model tree SHA-256: {name}")
-        elif expected and model_dir.is_dir() and sha256_tree(model_dir).lower() != expected.lower():
-            errors.append(f"model tree SHA-256 mismatch: {name}")
-        if name.startswith("qwen3-") and model_dir.is_dir():
-            for filename in (
+        if name.startswith("qwen3-"):
+            required_files = (
                 "config.json",
                 "merges.txt",
                 "quantization_config.json",
                 "tokenizer_config.json",
                 "vocab.json",
                 "weights.safetensors",
-            ):
+            )
+            download = entry.get("download")
+            if not isinstance(download, dict):
+                errors.append(f"missing model download metadata: {name}")
+            else:
+                url = download.get("url")
+                archive_sha = download.get("archive_sha256")
+                archive_size = download.get("archive_size")
+                weight_sha = download.get("weight_sha256")
+                file_sha = download.get("file_sha256")
+                pinned_files = download.get("required_files")
+                if not isinstance(url, str) or not url.startswith("https://"):
+                    errors.append(f"invalid model download URL: {name}")
+                for field, value in (
+                    ("archive_sha256", archive_sha),
+                    ("weight_sha256", weight_sha),
+                ):
+                    if (
+                        not isinstance(value, str)
+                        or len(value) != 64
+                        or any(char not in "0123456789abcdefABCDEF" for char in value)
+                    ):
+                        errors.append(f"invalid {field}: {name}")
+                if not isinstance(archive_size, int) or archive_size <= 0:
+                    errors.append(f"invalid archive_size: {name}")
+                if not isinstance(pinned_files, list) or set(pinned_files) != set(required_files):
+                    errors.append(f"invalid required_files: {name}")
+                if not isinstance(file_sha, dict) or set(file_sha) != set(required_files):
+                    errors.append(f"invalid file_sha256: {name}")
+                elif any(
+                    not isinstance(value, str)
+                    or len(value) != 64
+                    or any(char not in "0123456789abcdefABCDEF" for char in value)
+                    for value in file_sha.values()
+                ):
+                    errors.append(f"invalid file_sha256 digest: {name}")
+                elif file_sha.get("weights.safetensors", "").lower() != str(weight_sha).lower():
+                    errors.append(f"weight_sha256/file_sha256 mismatch: {name}")
+
+        if args.model_mode == "download-only" and key == "macos-arm64":
+            continue
+        if not model_dir.is_dir() or not any(model_dir.iterdir()):
+            errors.append(f"missing model: {model_dir}")
+            continue
+        if expected and sha256_tree(model_dir).lower() != str(expected).lower():
+            errors.append(f"model tree SHA-256 mismatch: {name}")
+        if name.startswith("qwen3-"):
+            for filename in required_files:
                 if not (model_dir / filename).is_file():
                     errors.append(f"missing local-only model file: {model_dir / filename}")
 

@@ -1,6 +1,6 @@
 # 离线音频剪辑器
 
-一款完全离线的 Windows/macOS 桌面工具，包含两个互不影响的工作区：
+一款模型准备完成后完全离线运行的 Windows/macOS 桌面工具，包含两个互不影响的工作区：
 
 - **Word 黄标剪辑**：读取带有 `发言人 HH:MM` 时间锚点的 DOCX；识别到的真实文字会
   从音频开头持续显示，并用同一批时间戳把每一处黄色高亮文字对齐到连续口播区间。未标记正文
@@ -14,8 +14,11 @@
    执行预检。文件选择器会记住两个工作区最近使用的目录。
    时间锚点支持 `发言人 12:34`、`发言人 张三 12:34` 和
    `发言人 张三 01:12:34` 三类常用写法。
-2. Apple 芯片 Mac 使用随安装包交付的 `Qwen3-ASR 0.6B 4-bit + Qwen3 Forced Aligner
-   0.6B 4-bit`，通过 MLX/Metal GPU 从前到后连续识别；Windows 保留离线
+2. Apple 芯片 Mac 使用固定版本的 `Qwen3-ASR 0.6B 4-bit + Qwen3 Forced Aligner
+   0.6B 4-bit`，通过 MLX/Metal GPU 从前到后连续识别；模型默认保存在
+   `~/Library/Application Support/CutVideo/models`；已有模型会原样保留，旧版 App
+   内嵌模型会在更新安装前迁移到只读的 `/Library/Application Support/CutVideo/models`，
+   只有两个位置都确实缺失或校验失败时才联网下载。Windows 保留离线
    `paraformer-zh + fsmn-vad + fa-zh` 路径。真实文字会随识别进度持续显示；同一批绝对
    时间戳再通过“唯一锚点 + VAD/段落约束的单调 DP”把完整 Word 正文映射到真实语音；
    重复句会比较前两名路径差距，差距不足时强制复核。为消除长音频累计时间漂移，每个含黄标
@@ -51,7 +54,8 @@
 
 项目会自动保存。再次选择相同文件时按 SHA-256 复用分析结果；文件移动后可在打开项目时
 重新关联。对齐算法版本也写入项目；旧版“Word 时间主导”项目不会被静默复用，必须重新
-分析。应用不登录、不上传、不遥测，运行时不会访问网络。
+分析。应用不登录、不上传音频或文稿、不遥测；只有 Apple 芯片 Mac 缺少本地模型时，才会
+从版本化发布资源下载固定模型压缩包。下载完成并通过 SHA-256 校验后，识别和剪辑均可断网运行。
 
 在 Apple 芯片 Mac 上，Qwen 识别和强制对齐固定使用 MLX/Metal GPU；正式包不会在 GPU
 初始化失败后悄悄退回慢速 CPU 并继续给出看似正常的结果。模型采用 0.6B 4-bit，以控制
@@ -126,7 +130,8 @@ resources/
 ```
 
 可用 `CUTVIDEO_RESOURCE_ROOT`、`CUTVIDEO_FFMPEG`、`CUTVIDEO_FFPROBE`、
-`CUTVIDEO_MODEL_ROOT` 覆盖开发路径。应用只接受本地模型目录。
+`CUTVIDEO_MODEL_ROOT` 覆盖开发路径。应用只把校验完成的本地模型目录交给识别后端；自动下载
+仅用于恢复缺失的固定模型，不会让模型库在推理时自行联网。
 
 如模型资源缺失，可在接受对应模型许可证后执行：
 
@@ -149,7 +154,7 @@ FFmpeg、许可证和 Qt 运行库都在同一目录树内。FFmpeg/FFprobe 子�
 
 ## Apple Silicon macOS 打包
 
-GitHub 仓库不保存约 1.06 GB 的模型权重或平台 FFmpeg 二进制。必须在 macOS 13+
+Git 仓库不保存约 1.06 GB 的模型权重或平台 FFmpeg 二进制。必须在 macOS 13+
 Apple Silicon 机器上原生执行；下面一条命令会安装缺少的 Homebrew 依赖、建立 Python
 3.11 环境、按固定提交下载模型、构建 LGPL FFmpeg，并生成应用与 DMG：
 
@@ -159,8 +164,13 @@ cd cutVideo
 bash scripts/bootstrap_macos.sh --accept-model-licenses
 ```
 
-产物为 `dist/CutVideo.app` 与 `dist/CutVideo.dmg`。首次准备需要下载约 1 GB 模型并编译
-FFmpeg，请预留至少 12 GB 可用空间。重复构建可复用已下载模型和 FFmpeg 构建目录。
+产物为 `dist/CutVideo.pkg` 与 `dist/CutVideo.dmg`；DMG 内只有一个代码安装包，不包含
+模型权重。构建阶段仍会用本机固定模型对冻结后的 App 做真实推理自检，因此首次构建需要
+下载约 1 GB 模型并编译 FFmpeg，请预留至少 12 GB 可用空间。重复构建可复用已下载模型和
+FFmpeg 构建目录。安装包会在覆盖旧版 App 前，把旧包内两套模型原样迁移到用户的
+系统级 Application Support；新用户或本地模型损坏时，应用启动后才下载两个固定压缩包到
+用户 Application Support，支持断点续传，并依次校验压缩包、权重文件和完整模型目录
+SHA-256。
 发布依赖通过 `constraints-release.txt` 固定；脚本同时检查 Python 与产物必须为原生 arm64，
 并设置 `MACOSX_DEPLOYMENT_TARGET=15.0`。构建会遍历应用内全部 Mach-O，任何二进制的
 最低系统版本高于 15.0 或不是纯 arm64 都会让构建失败；最终仍应在实际 macOS 15 机器上复验。
@@ -186,9 +196,10 @@ Mac 产物仍需在目标机器上断网执行完整验收。
 测试覆盖 DOCX OOXML、两类项目校验、完整转写 token、文字删除标注、模型结果适配、实际 PCM 时间轴、切点收缩、试听、
 96 kHz/多声道输入、双格式导出、源文件替换拒绝和四文件提交回滚。
 
-打包脚本还会启动冻结后的程序执行 `--self-test-models`：从发布目录发现 FFmpeg，分别运行
-`fa-zh` 与 `paraformer-zh + fsmn-vad` 的随包示例推理，并验证 PCM 试听后端可导入。任一
-模型、FFmpeg、Qt 音频后端缺失或冻结依赖不完整都会直接让构建失败。
+打包脚本还会启动冻结后的程序执行 `--self-test-models`：从代码包发现 FFmpeg，并通过外置
+模型目录真实运行 Qwen ASR 与 Forced Aligner 的随包示例推理，同时验证 PCM 试听后端可导入。
+脚本还会拒绝任何包含 `.safetensors`/`.onnx` 权重的 macOS App；任一模型、FFmpeg、Qt
+音频后端缺失或冻结依赖不完整都会直接让构建失败。
 
 ## 输入约定与限制
 

@@ -72,7 +72,13 @@ from ..project import (
     load_project,
     save_project,
 )
-from ..resources import RuntimeResources, discover_resources, load_manifest
+from ..resources import (
+    RuntimeResources,
+    discover_resources,
+    find_resource_root,
+    load_manifest,
+    platform_key,
+)
 
 ProgressReporter = Callable[[float, str], None]
 Operation = Callable[["CancelToken", ProgressReporter], object]
@@ -337,6 +343,47 @@ def make_recognition_warmup_operation() -> Operation:
     return operation
 
 
+def make_model_preparation_operation(resource_root: Path | None = None) -> Operation:
+    """Ensure the exact Qwen model bundle exists before recognition starts."""
+
+    def operation(token: CancelToken, report: ProgressReporter) -> object:
+        from ..model_store import (
+            ModelPreparationCancelled,
+            ModelPreparationError,
+            ModelPreparationResult,
+            prepare_qwen_models,
+        )
+
+        def model_progress(value: float, message: str = "") -> None:
+            token.raise_if_cancelled()
+            report(value, message)
+
+        if platform_key() != "macos-arm64":
+            resources = discover_resources()
+            if not resources.has_models:
+                raise ModelPreparationError(
+                    f"本地识别模型不完整：{', '.join(resources.missing())}"
+                )
+            report(1.0, "本地识别模型已准备好")
+            return ModelPreparationResult(
+                model_root=resources.model_root or resources.root / "models",
+                source=resources.model_source,
+            )
+
+        try:
+            result = prepare_qwen_models(
+                cancelled=token.is_set,
+                progress=model_progress,
+                resource_root=resource_root,
+            )
+        except ModelPreparationCancelled as exc:
+            raise TaskCancelled(str(exc) or "操作已取消") from exc
+        token.raise_if_cancelled()
+        return result
+
+    return operation
+
+
 def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
     def operation(token: CancelToken, report: ProgressReporter) -> PreflightResult:
         report(0.01, "正在固定输入文件指纹…")
@@ -346,8 +393,19 @@ def make_preflight_operation(audio_path: str, document_path: str) -> Operation:
         report(0.04, "正在读取 Word 标注…")
         transcript = parse_docx(document_path)
         token.raise_if_cancelled()
-        resources = discover_resources()
-        tools = discover_ffmpeg(resource_root=resources.root)
+        resource_root = find_resource_root()
+        tools = discover_ffmpeg(resource_root=resource_root)
+        # Preflight only decodes inputs. Model paths are intentionally omitted
+        # so a 1.06 GB integrity pass never delays or blocks cancellation here;
+        # the analysis worker discovers verified models after bootstrap.
+        resources = RuntimeResources(
+            resource_root,
+            tools.ffmpeg,
+            tools.ffprobe,
+            None,
+            None,
+            None,
+        )
         report(0.08, "正在解码音频并建立准确时间轴…")
         info, waveform_envelope = probe_audio_with_waveform(
             audio_path,
@@ -419,7 +477,10 @@ def make_analysis_operation(
         token.raise_if_cancelled()
         _require_preflight_sources(preflight, "自动分析开始前")
         report(0.03, "正在准备本地对齐模型…")
-        resources = preflight.resources
+        # Preflight can finish while the first-launch model bootstrap is still
+        # running. Refresh here so analysis never keeps the pre-bootstrap
+        # bundled-model snapshot after an external/migrated store becomes ready.
+        resources = discover_resources()
         force_aligner, asr_aligner = _runtime_aligners(
             resources,
             ffmpeg_path=preflight.tools.ffmpeg,
@@ -1085,6 +1146,7 @@ __all__ = [
     "make_analysis_operation",
     "make_export_operation",
     "make_load_project_operation",
+    "make_model_preparation_operation",
     "make_preflight_operation",
     "make_preview_operation",
     "make_recognition_warmup_operation",

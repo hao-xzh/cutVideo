@@ -7,9 +7,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
-class ResourceError(RuntimeError):
-    """Raised when an offline runtime resource is missing or unsupported."""
+from .model_store import (
+    QWEN_ASR_MODEL,
+    QWEN_FORCE_MODEL,
+    ResourceError,
+    default_model_root,
+    qwen_models_ready,
+    system_model_root,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +27,8 @@ class RuntimeResources:
     vad_model: Path | None
     qwen_asr_model: Path | None = None
     qwen_force_model: Path | None = None
+    model_root: Path | None = None
+    model_source: str = "bundle"
 
     @property
     def has_ffmpeg(self) -> bool:
@@ -64,13 +71,21 @@ class RuntimeResources:
         if not self.ffprobe or not self.ffprobe.is_file():
             missing.append("ffprobe")
         if not self.has_models:
-            for label, path in (
-                ("fa-zh", self.fa_model),
-                ("paraformer-zh", self.asr_model),
-                ("fsmn-vad", self.vad_model),
-            ):
-                if not path or not path.is_dir():
-                    missing.append(label)
+            if platform_key() == "macos-arm64":
+                for label, path in (
+                    (QWEN_ASR_MODEL, self.qwen_asr_model),
+                    (QWEN_FORCE_MODEL, self.qwen_force_model),
+                ):
+                    if not path or not path.is_dir():
+                        missing.append(label)
+            else:
+                for label, path in (
+                    ("fa-zh", self.fa_model),
+                    ("paraformer-zh", self.asr_model),
+                    ("fsmn-vad", self.vad_model),
+                ):
+                    if not path or not path.is_dir():
+                        missing.append(label)
         return missing
 
 
@@ -116,12 +131,33 @@ def _existing_dir(value: str | None, fallback: Path) -> Path | None:
     return path.resolve() if path.is_dir() else None
 
 
+def _select_model_root(resource_root: Path) -> tuple[Path, str]:
+    if value := os.environ.get("CUTVIDEO_MODEL_ROOT"):
+        return Path(value).expanduser(), "env"
+
+    if os.environ.get("CUTVIDEO_QWEN_ASR_MODEL") or os.environ.get("CUTVIDEO_QWEN_FORCE_MODEL"):
+        return default_model_root(), "env"
+
+    if platform_key() != "macos-arm64":
+        return resource_root / "models", "bundle"
+
+    external_root = default_model_root()
+    if qwen_models_ready(external_root, resource_root, full=False):
+        return external_root, "external"
+
+    installer_root = system_model_root()
+    if qwen_models_ready(installer_root, resource_root, full=False):
+        return installer_root, "installer-migrated"
+
+    return resource_root / "models", "bundle"
+
+
 def discover_resources() -> RuntimeResources:
     root = find_resource_root()
     key = platform_key()
     suffix = ".exe" if sys.platform == "win32" else ""
     binary_root = root / "bin" / key
-    model_root = Path(os.environ.get("CUTVIDEO_MODEL_ROOT", root / "models")).expanduser()
+    model_root, model_source = _select_model_root(root)
     return RuntimeResources(
         root=root,
         ffmpeg=_existing_file(os.environ.get("CUTVIDEO_FFMPEG"), binary_root / f"ffmpeg{suffix}"),
@@ -133,12 +169,14 @@ def discover_resources() -> RuntimeResources:
         vad_model=_existing_dir(None, model_root / "fsmn-vad"),
         qwen_asr_model=_existing_dir(
             os.environ.get("CUTVIDEO_QWEN_ASR_MODEL"),
-            model_root / "qwen3-asr-0.6b-4bit",
+            model_root / QWEN_ASR_MODEL,
         ),
         qwen_force_model=_existing_dir(
             os.environ.get("CUTVIDEO_QWEN_FORCE_MODEL"),
-            model_root / "qwen3-forced-aligner-0.6b-4bit",
+            model_root / QWEN_FORCE_MODEL,
         ),
+        model_root=model_root,
+        model_source=model_source,
     )
 
 

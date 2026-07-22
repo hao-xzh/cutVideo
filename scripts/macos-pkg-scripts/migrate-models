@@ -1,0 +1,110 @@
+#!/bin/sh
+
+# Preserve the exact Qwen bytes from the previously installed full app before
+# Installer atomically replaces it with the code-only bundle. The root-owned
+# store works for interactive, root and MDM installs and remains read-only to
+# every CutVideo user.
+set -eu
+
+ASR_NAME="qwen3-asr-0.6b-4bit"
+FORCE_NAME="qwen3-forced-aligner-0.6b-4bit"
+
+MERGES_SHA="8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+QUANT_SHA="3f46734b43db11c5651311d5241bdf164f16dc8ffb26e21e08492735ed22d542"
+VOCAB_SHA="ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+ASR_CONFIG_SHA="76d3ae4601ce939830b2517f4a6cadb86cc51316c3900af6b020b051c21a478c"
+ASR_TOKENIZER_SHA="4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c"
+ASR_WEIGHT_SHA="a7d0fa313d5cafecb8d846b40101c99f3f2a9f2e1e30a50f2bd9ad1363999e64"
+FORCE_CONFIG_SHA="d616c65d46c4b90bdc651b0a0963ea932732241140f337f9bb6b0335a9c8ef09"
+FORCE_TOKENIZER_SHA="3ab80063f8511deb9566e6ad438d17b7a6277fcffd52d92854112f19d36bd81c"
+FORCE_WEIGHT_SHA="1a3b3cb4b6ade6bda25ea7605462ecee72e680016179d778c6da096764782365"
+
+SOURCE_APP="${CUTVIDEO_PKG_SOURCE_APP:-/Applications/CutVideo.app}"
+SOURCE_MODELS="$SOURCE_APP/Contents/Resources/resources/models"
+TARGET_OVERRIDE="${CUTVIDEO_PKG_SYSTEM_STORE:-}"
+TARGET_PARENT="${TARGET_OVERRIDE:-/Library/Application Support/CutVideo}"
+TARGET_MODELS="$TARGET_PARENT/models"
+if [ -n "$TARGET_OVERRIDE" ]; then
+  TARGET_OWNER="${CUTVIDEO_PKG_TARGET_OWNER:-$(id -un):$(id -gn)}"
+else
+  TARGET_OWNER="root:wheel"
+fi
+
+file_matches() {
+  FILE_PATH="$1"
+  EXPECTED_SHA="$2"
+  [ -f "$FILE_PATH" ] || return 1
+  [ "$(shasum -a 256 "$FILE_PATH" | awk '{print $1}')" = "$EXPECTED_SHA" ]
+}
+
+model_matches() {
+  MODEL_DIR="$1"
+  CONFIG_SHA="$2"
+  TOKENIZER_SHA="$3"
+  WEIGHT_SHA="$4"
+  [ -d "$MODEL_DIR" ] || return 1
+  [ "$(find "$MODEL_DIR" -type f | wc -l | tr -d ' ')" = "6" ] || return 1
+  file_matches "$MODEL_DIR/config.json" "$CONFIG_SHA" || return 1
+  file_matches "$MODEL_DIR/merges.txt" "$MERGES_SHA" || return 1
+  file_matches "$MODEL_DIR/quantization_config.json" "$QUANT_SHA" || return 1
+  file_matches "$MODEL_DIR/tokenizer_config.json" "$TOKENIZER_SHA" || return 1
+  file_matches "$MODEL_DIR/vocab.json" "$VOCAB_SHA" || return 1
+  file_matches "$MODEL_DIR/weights.safetensors" "$WEIGHT_SHA" || return 1
+}
+
+models_match() {
+  ROOT="$1"
+  model_matches "$ROOT/$ASR_NAME" "$ASR_CONFIG_SHA" "$ASR_TOKENIZER_SHA" "$ASR_WEIGHT_SHA" \
+    && model_matches \
+      "$ROOT/$FORCE_NAME" \
+      "$FORCE_CONFIG_SHA" \
+      "$FORCE_TOKENIZER_SHA" \
+      "$FORCE_WEIGHT_SHA"
+}
+
+# Preserve an already verified system store without touching its timestamps.
+if models_match "$TARGET_MODELS"; then
+  exit 0
+fi
+
+# A new install has no old bundle. A mismatched old bundle is never treated as
+# the accepted model version; runtime recovery will download pinned assets.
+if ! models_match "$SOURCE_MODELS"; then
+  exit 0
+fi
+
+mkdir -p "$TARGET_PARENT"
+chown "$TARGET_OWNER" "$TARGET_PARENT"
+chmod 0755 "$TARGET_PARENT"
+STAGING="$TARGET_PARENT/.models-migration-$$"
+BACKUP="$TARGET_PARENT/.models-before-migration-$$"
+BACKED_UP=0
+PUBLISHED=0
+
+cleanup() {
+  if [ "$PUBLISHED" -eq 0 ] && [ "$BACKED_UP" -eq 1 ] && [ ! -e "$TARGET_MODELS" ]; then
+    mv "$BACKUP" "$TARGET_MODELS" || true
+  fi
+  rm -rf "$STAGING"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$STAGING"
+ditto "$SOURCE_MODELS/$ASR_NAME" "$STAGING/$ASR_NAME"
+ditto "$SOURCE_MODELS/$FORCE_NAME" "$STAGING/$FORCE_NAME"
+models_match "$STAGING"
+
+chown -R "$TARGET_OWNER" "$STAGING"
+chmod -R a+rX,u+w "$STAGING"
+if [ -e "$TARGET_MODELS" ]; then
+  mv "$TARGET_MODELS" "$BACKUP"
+  BACKED_UP=1
+fi
+mv "$STAGING" "$TARGET_MODELS"
+PUBLISHED=1
+if [ "$BACKED_UP" -eq 1 ]; then
+  rm -rf "$BACKUP"
+  BACKED_UP=0
+fi
+trap - EXIT HUP INT TERM
+exit 0

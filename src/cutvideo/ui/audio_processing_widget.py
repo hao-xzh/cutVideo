@@ -103,6 +103,7 @@ class AudioProcessingWidget(QWidget):
 
     statusMessage = Signal(str)
     transcriptPartial = Signal(int, object)
+    modelPreparationRequested = Signal()
 
     def __init__(self, thread_pool: QThreadPool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -133,6 +134,10 @@ class AudioProcessingWidget(QWidget):
         self._source_generation = 0
         self._transcription_generation = 0
         self._active_transcription_generation = 0
+        self._models_ready = False
+        self._model_bootstrap_active = False
+        self._model_bootstrap_message = ""
+        self._pending_refinement_draft: AudioProcessingAnalysisResult | None = None
         template = str(Path(QDir.tempPath()) / "cutvideo-audio-processing-XXXXXX")
         self._preview_directory = QTemporaryDir(template)
         self._player = PcmWavPlayer(self)
@@ -150,6 +155,22 @@ class AudioProcessingWidget(QWidget):
         )
         self._connect_signals()
         self._refresh_controls()
+
+    def set_model_bootstrap_state(
+        self,
+        *,
+        ready: bool,
+        active: bool,
+        message: str = "",
+    ) -> None:
+        """Receive model-preparation state from the owning main window."""
+
+        self._models_ready = ready
+        self._model_bootstrap_active = active
+        self._model_bootstrap_message = message
+        self._refresh_controls()
+        if ready and self._pending_refinement_draft is not None:
+            QTimer.singleShot(0, self._resume_pending_refinement)
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -548,6 +569,7 @@ class AudioProcessingWidget(QWidget):
             # model window after the user has selected a different source.
             self._active_transcription_generation = 0
             self._transcript_typewriter.clear()
+        self._pending_refinement_draft = None
         self._cancel_refinement_task()
         if self._active_task is not None:
             self._active_task.cancel()
@@ -645,6 +667,16 @@ class AudioProcessingWidget(QWidget):
                 "请选择一个存在且格式受支持的音频文件。",
             )
             return
+        if not self._models_ready:
+            self.modelPreparationRequested.emit()
+            if self._model_bootstrap_active:
+                message = self._model_bootstrap_message or "正在准备本地模型，请稍后开始连续识别"
+            else:
+                message = "本地模型尚未准备好，正在尝试准备/下载；完成后请再次点击连续识别"
+            self.summary_label.setText(message)
+            self.statusMessage.emit(message)
+            return
+        self._pending_refinement_draft = None
         self._cancel_refinement_task()
         self._transcription_generation += 1
         generation = self._transcription_generation
@@ -747,25 +779,36 @@ class AudioProcessingWidget(QWidget):
                 self.summary_label.text() + " · 旧项目需重新识别以启用语义分段"
             )
         if value.refinement_pending:
+            self._pending_refinement_draft = value
             self.summary_label.setText(
-                self.summary_label.text() + " · 后台细化逐字时间戳中"
-            )
-            self.statusMessage.emit(
-                f"已流式输出 {len(value.project.tokens)} 个文字；"
-                "正在后台完成逐字对齐，对齐后即可精确选择和试听…"
+                self.summary_label.text()
                 + (
-                    "；该旧项目需重新导入原音频才能使用语义分段"
-                    if semantic_upgrade_required
-                    else ""
+                    " · 后台细化逐字时间戳中"
+                    if self._models_ready
+                    else " · 模型就绪后自动细化逐字时间戳"
                 )
             )
-            QTimer.singleShot(0, lambda: self._start_refinement_task(value))
+            if self._models_ready:
+                self.statusMessage.emit(
+                    f"已流式输出 {len(value.project.tokens)} 个文字；"
+                    "正在后台完成逐字对齐，对齐后即可精确选择和试听…"
+                    + (
+                        "；该旧项目需重新导入原音频才能使用语义分段"
+                        if semantic_upgrade_required
+                        else ""
+                    )
+                )
+                QTimer.singleShot(0, self._resume_pending_refinement)
+            else:
+                self.statusMessage.emit("项目已打开；模型就绪后会自动继续逐字时间戳细化")
         elif semantic_upgrade_required:
+            self._pending_refinement_draft = None
             self.statusMessage.emit(
                 "旧项目未保存 Qwen 原始标点；已用长停顿改善分段，"
                 "重新导入同一音频后可启用完整语义分段"
             )
         else:
+            self._pending_refinement_draft = None
             self.statusMessage.emit(
                 f"连续识别完成：{len(value.project.tokens)} 个时间戳文字，可选择文字建立标注"
             )
@@ -794,6 +837,18 @@ class AudioProcessingWidget(QWidget):
                     waveform_ready,
                 ),
             )
+
+    def _resume_pending_refinement(self) -> None:
+        draft = self._pending_refinement_draft
+        if (
+            draft is None
+            or not self._models_ready
+            or self._active_task is not None
+            or self._refinement_task is not None
+        ):
+            return
+        self._pending_refinement_draft = None
+        self._start_refinement_task(draft)
 
     def _start_refinement_task(self, draft: AudioProcessingAnalysisResult) -> None:
         if (
@@ -1772,6 +1827,8 @@ class AudioProcessingWidget(QWidget):
         self._task_uses_progress = True
         self._sync_workspace_page()
         self._refresh_controls()
+        if self._models_ready and self._pending_refinement_draft is not None:
+            QTimer.singleShot(0, self._resume_pending_refinement)
 
     def _cancel_task(self) -> None:
         if self._refinement_task is not None and self._active_task is None:
@@ -1819,6 +1876,13 @@ class AudioProcessingWidget(QWidget):
             audio_source.is_file() and audio_source.suffix.casefold() in _AUDIO_SUFFIXES
         )
         self.transcribe_button.setEnabled(not busy and supported_audio)
+        if not self._models_ready:
+            if self._model_bootstrap_active:
+                self.transcribe_button.setToolTip("本地模型正在准备，点击可查看当前准备状态")
+            else:
+                self.transcribe_button.setToolTip("本地模型未就绪，点击后会重新准备/下载模型")
+        else:
+            self.transcribe_button.setToolTip("")
         self.add_delete_button.setEnabled(
             not busy
             and ready

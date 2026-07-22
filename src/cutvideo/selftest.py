@@ -52,6 +52,8 @@ def _run_self_test(*, include_models: bool) -> dict[str, Any]:
         raise RuntimeError(f"bundled FFmpeg failed: {version.stderr.strip()}")
     report: dict[str, Any] = {
         "resource_root": str(resources.root),
+        "model_root": str(getattr(resources, "model_root", "") or ""),
+        "model_source": str(getattr(resources, "model_source", "") or ""),
         "platform_manifest": load_manifest(resources.root).get("schema_version"),
         "ffmpeg_version": version.stdout.splitlines()[0] if version.stdout else "",
         "models_tested": False,
